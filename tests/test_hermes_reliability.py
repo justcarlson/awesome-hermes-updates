@@ -162,6 +162,7 @@ def test_weekly_updater_stops_when_default_python_gate_fails(
         "NPM_CHECK_MARKER": str(npm_check_marker),
         "HERMES_UPDATE_REPO": str(production),
         "HERMES_UPDATE_STATE_DIR": str(state),
+        "HERMES_UPDATE_MAX_REPAIRS": "4",
         "HERMES_UPDATE_REPAIR_COMMAND": "/bin/false",
         "HERMES_UPDATE_DEPLOY_COMMAND": "/bin/true",
         "HERMES_UPDATE_HEALTH_COMMAND": "/bin/true",
@@ -233,28 +234,18 @@ def test_weekly_update_is_scheduled_inside_a_hard_resource_boundary() -> None:
     assert "CPUQuota=600%" in service
     assert "TimeoutStartSec=4h" in service
     assert "OOMPolicy=stop" in service
-    assert "OnCalendar=Sun *-*-* 03:15:00 America/New_York" in timer
+    assert "America/New_York" not in timer
     assert "Persistent=true" in timer
 
 
-def test_weekly_updater_matches_upstream_ci_dependency_contract() -> None:
-    updater = WEEKLY_UPDATER.read_text()
-
-    required_extras = (
-        "all",
-        "dev",
-        "anthropic",
-        "mistral",
-        "fal",
-        "modal",
-        "daytona",
-        "hindsight",
-        "parallel-web",
-    )
-    for extra in required_extras:
-        assert f"--extra {extra}" in updater
-    assert "--all-extras" not in updater
-    assert '--project "$repo" --inexact --extra all --locked' in updater
+def test_verifier_only_requests_supported_ci_extras(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project.optional-dependencies]\ndev = []\nanthropic = []\nmatrix = []\n')
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts/run_tests_parallel.py").touch()
+    result = subprocess.run([str(WEEKLY_UPDATER.with_name("hermes-update-state")),
+                             "verification-extras", str(tmp_path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["dev", "anthropic"]
 
 
 def test_weekly_updater_preserves_each_verification_stage() -> None:
@@ -270,15 +261,11 @@ def test_weekly_updater_preserves_each_verification_stage() -> None:
     assert "verify_attempt=1" in updater
 
 
-def test_weekly_updater_uses_managed_npm_and_real_http_health() -> None:
+def test_weekly_updater_uses_managed_npm_and_bounded_recovery() -> None:
     updater = WEEKLY_UPDATER.read_text()
 
     assert 'HERMES_UPDATE_NPM_VERSION:-12.0.2' in updater
     assert "run_verifier_npm ci --no-audit --no-fund" in updater
-    assert "http://127.0.0.1:8644/health" in updater
-    assert ":9119/api/health" in updater
-    assert ":9119/api/status" in updater
-    assert '.config_version == .latest_config_version' in updater
     assert 'timeout --signal=TERM --kill-after=30s 5m git -C "$repo" fetch --quiet origin "${HERMES_UPDATE_REF:-main}"' in updater
     assert "for attempt in 1 2 3" in updater
     assert "while ((verify_attempt <= 3))" in updater
@@ -300,15 +287,6 @@ def test_weekly_updater_records_marker_before_fast_forward() -> None:
     assert updater.index(marker) < updater.index(fast_forward)
     assert updater.rindex("verify_production_health") < updater.rindex(clear)
 
-
-def test_weekly_updater_invalidates_stale_update_status_before_restart() -> None:
-    updater = WEEKLY_UPDATER.read_text()
-
-    assert 'rm -f -- "$HOME/.hermes/.update_check"' in updater
-    assert 'profiles/*/.update_check' in updater
-    assert updater.index("\n  invalidate_update_caches\n") < updater.index(
-        "systemctl --user restart hermes-gateway.service hermes-dashboard.service"
-    )
 
 
 def test_weekly_updater_leaves_production_unchanged_when_candidate_fails(
@@ -338,6 +316,7 @@ def test_weekly_updater_leaves_production_unchanged_when_candidate_fails(
         "HERMES_UPDATE_REPO": str(production),
         "HERMES_UPDATE_STATE_DIR": str(home / "state"),
         "HERMES_UPDATE_VERIFY_COMMAND": "/bin/false",
+        "HERMES_UPDATE_MAX_REPAIRS": "4",
         "HERMES_UPDATE_REPAIR_COMMAND": "/bin/false",
         "HERMES_UPDATE_DEPLOY_COMMAND": "/bin/true",
         "HERMES_UPDATE_HEALTH_COMMAND": "/bin/true",
@@ -440,6 +419,7 @@ def test_weekly_updater_resumes_fixed_candidate_without_target_drift(
         "HERMES_UPDATE_REPO": str(production),
         "HERMES_UPDATE_STATE_DIR": str(state),
         "HERMES_UPDATE_VERIFY_COMMAND": verify_command,
+        "HERMES_UPDATE_MAX_REPAIRS": "4",
         "HERMES_UPDATE_REPAIR_COMMAND": repair_command,
         "HERMES_UPDATE_DEPLOY_COMMAND": "/bin/true",
         "HERMES_UPDATE_HEALTH_COMMAND": "/bin/true",
@@ -786,7 +766,8 @@ def test_weekly_updater_resumes_an_interrupted_dirty_repair(
         env={
             **base_env,
             "HERMES_UPDATE_VERIFY_COMMAND": "/bin/false",
-            "HERMES_UPDATE_REPAIR_COMMAND": (
+            "HERMES_UPDATE_MAX_REPAIRS": "4",
+        "HERMES_UPDATE_REPAIR_COMMAND": (
                 "printf 'unfinished\\n' > interrupted.txt; exit 1"
             ),
         },
@@ -807,7 +788,8 @@ def test_weekly_updater_resumes_an_interrupted_dirty_repair(
         env={
             **base_env,
             "HERMES_UPDATE_VERIFY_COMMAND": "/bin/true",
-            "HERMES_UPDATE_REPAIR_COMMAND": (
+            "HERMES_UPDATE_MAX_REPAIRS": "4",
+        "HERMES_UPDATE_REPAIR_COMMAND": (
                 "git add interrupted.txt; "
                 "git commit -m 'complete interrupted repair'"
             ),

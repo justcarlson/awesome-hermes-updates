@@ -59,7 +59,7 @@ def test_artifact_symlink_never_moves_or_reads_external_source(tmp_path):
 def python_case(tmp_path):
     _, repo, home, _ = _update_case(tmp_path)
     (repo / "tests").mkdir()
-    (repo / "scripts").mkdir()
+    (repo / "scripts").mkdir(exist_ok=True)
     with (repo / ".gitignore").open("a") as stream:
         stream.write("__pycache__/\n")
     (repo / "runtime.py").write_text("version = 1\n")
@@ -354,6 +354,8 @@ def test_controller_revision_gets_bounded_retries_without_resetting_total(tmp_pa
     script = controller / WEEKLY_UPDATER.name
     helper = controller / HELPER.name
     shutil.copy2(WEEKLY_UPDATER, script)
+    for name in ('hermes-update-config', 'hermes-update-deployment'):
+        shutil.copy2(WEEKLY_UPDATER.with_name(name), controller / name)
     shutil.copy2(HELPER, helper)
     env['HERMES_UPDATE_VERIFY_COMMAND'] = 'exit 69'
     def start():
@@ -459,12 +461,15 @@ def test_no_update_repairs_runtime_with_pending_state_and_then_becomes_cheap(tmp
     from test_hermes_updater_unattended import _python_tool
     _, repo, home, env = _update_case(tmp_path)
     env.pop('HERMES_UPDATE_DEPLOY_COMMAND')
+    env['HERMES_UPDATE_PYTHON'] = 'off'
     (home / '.hermes').mkdir()
     env['HERMES_UPDATE_TARGET_SHA'] = _git('rev-parse', 'HEAD', cwd=repo)
     controller = home / 'controller'
     controller.mkdir()
     script = controller / WEEKLY_UPDATER.name
     shutil.copy2(WEEKLY_UPDATER, script)
+    for name in ('hermes-update-config', 'hermes-update-deployment'):
+        shutil.copy2(WEEKLY_UPDATER.with_name(name), controller / name)
     events, safe = home / 'events', home / 'runtime-safe'
     helper = controller / HELPER.name
     _python_tool(helper, f'''
@@ -483,6 +488,7 @@ import sys
 from pathlib import Path
 with Path({str(events)!r}).open('a') as stream: stream.write(' '.join(sys.argv[1:]) + '\\n')
 if 'list-units' in sys.argv: print('hermes-gateway.service loaded active running')
+if '--property=Environment' in sys.argv: print('Environment=VIRTUAL_ENV={repo}/venv HERMES_HOME={home}/.hermes')
 ''')
     _python_tool(repo / 'venv/bin/python', 'pass\n')
     env['PATH'] = str(home / 'bin') + ':' + env['PATH']
@@ -493,9 +499,14 @@ if 'list-units' in sys.argv: print('hermes-gateway.service loaded active running
     assert not (home / 'state/promotion-pending').exists()
     assert _git('rev-parse', 'HEAD', cwd=repo) == env['HERMES_UPDATE_TARGET_SHA']
     calls = events.read_text()
-    assert 'stop hermes-gateway.service hermes-dashboard.service' in calls
+    assert 'stop hermes-gateway.service' in calls
+    assert 'stop hermes-gateway.service hermes-dashboard.service' not in calls
     assert 'runtime-repair' in calls
-    assert 'restart hermes-gateway.service hermes-dashboard.service' in calls
+    assert 'restart hermes-gateway.service' in calls
+    assert 'restart hermes-gateway.service hermes-dashboard.service' not in calls
     second = start()
     assert second.returncode == 0, second.stdout + second.stderr
-    assert events.read_text() == calls
+    new_calls = events.read_text()[len(calls):]
+    assert "runtime-repair" not in new_calls
+    assert "stop " not in new_calls
+    assert "restart " not in new_calls

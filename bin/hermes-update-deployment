@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# Sourced by hermes-weekly-update. Scope is frozen before candidate work begins.
+
+policy_error() { printf 'BLOCKED %s\n' "$*" >&2; return 78; }
+
+profile_home_for_unit() {
+  local name="${1#hermes-gateway-}"
+  profile_home="${HERMES_UPDATE_HOME:-$HOME/.hermes}"
+  [[ "$1" == hermes-gateway.service ]] || profile_home+="/profiles/${name%.service}"
+}
+
+policy_snapshot() {
+  /usr/bin/python3 - "$profiles_file" "$1" "${2:-}" "$repo" "$update_home" \
+    "$policy_request" "$update_python" "$update_node" "$update_dashboard" \
+    "$update_gateway" "$update_migrate" "$update_runtime" \
+    "$(printf '%s\n' "${deployment_profiles[@]}")" \
+    "$(printf '%s\n' "${selected_profile_homes[@]}")" \
+    "${dashboard_was_active:-0}" "$(printf '%s\n' "${active_gateway_units[@]}")" "${dashboard_shares_runtime:-0}" <<'PY'
+import json, os, pathlib, re, sys
+path, action, previous, repo, home, request, *values = sys.argv[1:]
+path = pathlib.Path(path)
+keys = ('python', 'node', 'dashboard', 'gateway', 'migrate', 'runtime')
+try:
+    if action in ('save', 'migrate'):
+        data = dict(version=1, previous=previous, repo=repo, home=home, request=request,
+                    scope=dict(zip(keys, map(int, values[:6]))),
+                    units=values[6].splitlines(), homes=values[7].splitlines(),
+                    dashboard_active=int(values[8]), active_units=values[9].splitlines(), dashboard_shared=int(values[10]))
+        if action == 'migrate':
+            original = path.read_text()
+            assert original.splitlines()[0] == previous, 'legacy inventory does not match previous source'
+            backup = path.with_name(path.name + '.legacy')
+            try:
+                with backup.open('x') as saved:
+                    saved.write(original)
+                backup.chmod(0o600)
+            except FileExistsError:
+                assert backup.read_text() == original, 'legacy evidence backup differs; preserve both inventories before resuming'
+        tmp = path.with_name(path.name + f'.tmp.{os.getpid()}')
+        tmp.write_text(json.dumps(data, sort_keys=True) + '\n')
+        tmp.chmod(0o600)
+        os.replace(tmp, path)
+    else:
+        raw = path.read_text()
+        legacy = not raw.lstrip().startswith('{')
+        if legacy:
+            lines = raw.splitlines()
+            assert len(lines) >= 2 and re.fullmatch('[a-f0-9]{40}', lines[0]), 'unsupported legacy inventory'
+            assert lines[1] == 'hermes-gateway.service', 'legacy inventory lacks the default gateway'
+            assert len(set(lines[1:])) == len(lines[1:]), 'duplicate legacy gateway units'
+            assert request == 'auto|auto|auto|auto|auto|auto||auto', 'unfinished legacy update requires default auto scope and no extras; finish it before changing scope'
+            assert home == str(pathlib.Path.home() / '.hermes'), 'unfinished legacy update requires its original ~/.hermes home'
+            units = lines[1:]
+            homes = [home if unit == 'hermes-gateway.service' else home + '/profiles/' + unit[len('hermes-gateway-'):-len('.service')]
+                     for unit in units]
+            data = dict(version=1, previous=lines[0], repo=repo, home=home, request=request,
+                        scope=dict.fromkeys(keys, 1), units=units, homes=homes,
+                        dashboard_active=1, active_units=units)
+        else:
+            data = json.loads(raw)
+        assert data['version'] == 1 and data['repo'] == repo and data['home'] == home
+        assert data['request'] == request, 'settings changed during an unfinished update; restore the recorded settings'
+        assert re.fullmatch('[a-f0-9]{40}', data['previous'])
+        assert not previous or data['previous'] == previous, 'inventory does not match previous source'
+        assert set(data['scope']) == set(keys)
+        assert all(type(v) is int and v in (0, 1) for v in data['scope'].values())
+        assert type(data['dashboard_active']) is int and data['dashboard_active'] in (0, 1)
+        data.setdefault('dashboard_shared', data['dashboard_active'])
+        assert type(data['dashboard_shared']) is int and data['dashboard_shared'] in (0, 1)
+        assert data['dashboard_shared'] >= data['dashboard_active']
+        for field in ('units', 'active_units'):
+            assert isinstance(data[field], list)
+            assert all(isinstance(u, str) and re.fullmatch(r'hermes-gateway(?:-[A-Za-z0-9_-]+)?\.service', u) for u in data[field])
+        assert set(data['units']) <= set(data['active_units'])
+        assert isinstance(data['homes'], list)
+        for p in data['homes']:
+            assert isinstance(p, str) and (p == home or re.fullmatch(re.escape(home) + r'/profiles/[A-Za-z0-9_-]+', p))
+        if legacy:
+            print('legacy_previous', data['previous'], sep='\t')
+        for key in keys:
+            print(key, data['scope'][key], sep='\t')
+        print('dashboard_active', data['dashboard_active'], sep='\t')
+        print('dashboard_shared', data['dashboard_shared'], sep='\t')
+        for key, field in (('unit', 'units'), ('home', 'homes'), ('active', 'active_units')):
+            for value in data[field]:
+                print(key, value, sep='\t')
+except (AssertionError, KeyError, TypeError, ValueError, OSError) as error:
+    print(f'BLOCKED invalid deployment scope snapshot: {error or "unsupported or malformed inventory"}', file=sys.stderr)
+    sys.exit(78)
+PY
+}
+
+# Prove which installation owns an active unit before including it in scope.
+# Output: owned (same checkout and expected home), shared (same checkout, other
+# home), unrelated (different checkout). Unknown identities fail closed.
+service_installation_identity() {
+  local unit="$1" expected_home="$2" properties
+  properties="$(systemctl --user show "$unit" --property=Environment --property=ExecStart --property=WorkingDirectory 2>/dev/null)" || {
+    policy_error "cannot inspect active service identity: $unit"; return 78;
+  }
+  /usr/bin/python3 - "$unit" "$repo" "$expected_home" "$properties" <<'PYIDENTITY'
+import pathlib, re, shlex, sys
+unit, repo, expected_home, properties = sys.argv[1:]
+try:
+    fields = dict(line.split('=', 1) for line in properties.splitlines() if '=' in line)
+    environment = dict(item.split('=', 1) for item in shlex.split(fields.get('Environment', '')) if '=' in item)
+    roots = []
+    if environment.get('VIRTUAL_ENV'):
+        roots.append(pathlib.Path(environment['VIRTUAL_ENV']).resolve())
+    executable = re.search(r'(?:^|[ {;])path=([^;]+?)(?:\s*;|$)', fields.get('ExecStart', ''))
+    if executable:
+        path = pathlib.Path(executable.group(1).strip())
+        if path.parent.name == 'bin' and path.parent.parent.name == 'venv':
+            roots.append(path.parent.parent.resolve())
+    assert roots and len(set(roots)) == 1, 'missing or conflicting checkout identity'
+    if roots[0] != (pathlib.Path(repo) / 'venv').resolve():
+        print('unrelated')
+        raise SystemExit(0)
+    actual_home = environment.get('HERMES_HOME')
+    if not actual_home and unit.startswith('hermes-gateway'):
+        actual_home = fields.get('WorkingDirectory')
+    assert actual_home and pathlib.Path(actual_home).is_absolute(), 'missing Hermes home identity'
+    print('owned' if pathlib.Path(actual_home).resolve() == pathlib.Path(expected_home).resolve() else 'shared')
+except (ValueError, AssertionError, OSError) as error:
+    print(f'BLOCKED cannot establish active service identity for {unit}: {error}', file=sys.stderr)
+    raise SystemExit(78)
+PYIDENTITY
+}
+
+resolve_update_policy() {
+  [[ "${update_policy_resolved:-0}" == 0 ]] || return 0
+  update_home="${HERMES_UPDATE_HOME:-$HOME/.hermes}"
+  local key setting cap inventory='' unit name output
+  update_python=0 update_node=0 update_dashboard=0 update_gateway=0 update_migrate=0 update_runtime=0
+  dashboard_was_active=0 dashboard_shares_runtime=0
+  deployment_profiles=() selected_profile_homes=() active_gateway_units=()
+  policy_request="${HERMES_UPDATE_PYTHON:-auto}|${HERMES_UPDATE_NODE:-auto}|${HERMES_UPDATE_DASHBOARD:-auto}|${HERMES_UPDATE_GATEWAY:-auto}|${HERMES_UPDATE_MIGRATE:-auto}|${HERMES_UPDATE_RUNTIME:-auto}|${HERMES_UPDATE_EXTRAS:-}|${HERMES_UPDATE_PROFILES:-auto}"
+  if [[ -f "$profiles_file" ]]; then
+    output="$(policy_snapshot load)" || return "$?"
+    while IFS=$'\t' read -r key setting; do
+      case "$key" in
+        python) update_python="$setting";; node) update_node="$setting";;
+        dashboard) update_dashboard="$setting";; gateway) update_gateway="$setting";;
+        migrate) update_migrate="$setting";; runtime) update_runtime="$setting";;
+        dashboard_active) dashboard_was_active="$setting";;
+        dashboard_shared) dashboard_shares_runtime="$setting";;
+        unit) deployment_profiles+=("$setting");; home) selected_profile_homes+=("$setting");;
+        active) active_gateway_units+=("$setting");;
+        legacy_previous) legacy_policy_previous="$setting";;
+      esac
+    done <<<"$output"
+    update_policy_resolved=1
+    return 0
+  fi
+  if [[ "${HERMES_UPDATE_PROFILES:-auto}" == auto ]]; then
+    [[ ! -d "$update_home" ]] || selected_profile_homes+=("$update_home")
+    for name in "$update_home"/profiles/*; do
+      [[ -d "$name" && "${name##*/}" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+      selected_profile_homes+=("$name")
+    done
+  else
+    local -a names
+    IFS=',' read -r -a names <<<"$HERMES_UPDATE_PROFILES"
+    for name in "${names[@]}"; do
+      [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || { policy_error "invalid profile: $name"; return 78; }
+      profile_home="$update_home/profiles/$name"
+      [[ "$name" != default ]] || profile_home="$update_home"
+      [[ -d "$profile_home" ]] || { policy_error "selected profile home is missing: $profile_home"; return 78; }
+      selected_profile_homes+=("$profile_home")
+    done
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if ! inventory="$(systemctl --user list-units 'hermes-gateway*.service' 'hermes-dashboard.service' --state=active,activating,reloading --plain --no-legend --no-pager 2>/dev/null)"; then
+      inventory=''
+      # A missing user manager is normal for CLI-only installs. If it is
+      # reachable, an inventory failure must not silently omit active services.
+      if systemctl --user show-environment >/dev/null 2>&1; then
+        policy_error 'cannot inventory services from the running systemd user manager'; return 78
+      fi
+    fi
+  fi
+  local identity
+  while read -r unit _; do
+    if [[ "$unit" == hermes-dashboard.service ]]; then
+      identity="$(service_installation_identity "$unit" "$update_home")" || return "$?"
+      [[ "$identity" != unrelated ]] || continue
+      dashboard_shares_runtime=1
+      [[ "$identity" != owned ]] || dashboard_was_active=1
+      continue
+    fi
+    [[ "$unit" =~ ^hermes-gateway(-[A-Za-z0-9_-]+)?\.service$ ]] || continue
+    profile_home_for_unit "$unit"
+    identity="$(service_installation_identity "$unit" "$profile_home")" || return "$?"
+    [[ "$identity" != unrelated ]] || continue
+    active_gateway_units+=("$unit")
+    [[ "$identity" == owned ]] || continue
+    for name in "${selected_profile_homes[@]}"; do
+      [[ "$profile_home" != "$name" ]] || deployment_profiles+=("$unit")
+    done
+  done <<<"$inventory"
+  for key in PYTHON NODE DASHBOARD GATEWAY MIGRATE RUNTIME; do
+    name="HERMES_UPDATE_$key"; setting="${!name:-auto}"; cap=0
+    case "$key" in
+      PYTHON|RUNTIME) [[ ! -x "$repo/venv/bin/python" ]] || cap=1;;
+      NODE) [[ ! -d "$repo/node_modules" ]] || cap=1
+        # Rebuilding an installed dashboard also needs its Node dependencies,
+        # even when a previous install removed node_modules after the build.
+        if [[ "${HERMES_UPDATE_DASHBOARD:-auto}" != off ]] \
+          && { [[ -d "$repo/hermes_cli/web_dist" || -d "$repo/web/dist" || "$dashboard_was_active" == 1 ]] \
+            || [[ "${HERMES_UPDATE_DASHBOARD:-auto}" == on && -f "$repo/web/package.json" ]]; }; then cap=1; fi
+        if [[ "$setting" == on && -f "$repo/package.json" ]]; then cap=1; fi;;
+      DASHBOARD) [[ ! -d "$repo/hermes_cli/web_dist" && ! -d "$repo/web/dist" && "$dashboard_was_active" == 0 ]] || cap=1
+        if [[ "$setting" == on && -f "$repo/web/package.json" ]]; then cap=1; fi
+        if [[ "$setting" == auto && "$update_node" == 0 ]]; then cap=0; fi;;
+      GATEWAY) ((${#deployment_profiles[@]} == 0)) || cap=1;;
+      MIGRATE) for name in "${selected_profile_homes[@]}"; do [[ ! -f "$name/config.yaml" ]] || cap=1; done
+        [[ -x "$repo/venv/bin/python" ]] || cap=0;;
+    esac
+    case "$setting" in
+      off) cap=0;; auto) :;; on) [[ "$cap" == 1 ]] || { policy_error "$name=on requires an existing applicable installation"; return 78; };;
+      *) policy_error "$name must be auto, on or off"; return 78;;
+    esac
+    printf -v "update_${key,,}" '%s' "$cap"
+  done
+  if [[ "$update_dashboard" == 1 && "$update_node" == 0 ]]; then
+    policy_error 'dashboard builds require node updates; enable node or turn dashboard off'; return 78
+  fi
+  if [[ "$update_gateway" == 1 && ! -x "$repo/venv/bin/python" ]]; then
+    policy_error 'active gateway maintenance requires repo/venv/bin/python'; return 78
+  fi
+  if [[ "$update_python" == 1 || "$update_runtime" == 1 ]]; then
+    deployment_uv="$(command -v uv || true)"
+    [[ -n "$deployment_uv" || ! -x "$update_home/bin/uv" ]] || deployment_uv="$update_home/bin/uv"
+    [[ -n "$deployment_uv" ]] || { policy_error 'Python/runtime updates require uv'; return 78; }
+  fi
+  if [[ "$update_node" == 1 || "$update_dashboard" == 1 ]]; then
+    command -v node >/dev/null && command -v npm >/dev/null || { policy_error 'node/dashboard updates require node and npm'; return 78; }
+  fi
+  [[ "$update_gateway" == 1 ]] || deployment_profiles=()
+  update_policy_resolved=1
+}
+
+load_deployment_profiles() {
+  resolve_update_policy || return "$?"
+  if [[ -f "$profiles_file" ]]; then
+    policy_snapshot load "$1" >/dev/null || return "$?"
+    if [[ -n "${legacy_policy_previous:-}" ]]; then
+      policy_snapshot migrate "$1" || return "$?"
+      legacy_policy_previous=''
+      printf 'MIGRATED_LEGACY_DEPLOYMENT_SCOPE evidence=%s.legacy\n' "$profiles_file"
+    fi
+  else policy_snapshot save "$1"; fi
+}
+
+preflight_deployment() {
+  local previous="$1" promoted="$2" manifest
+  resolve_update_policy || return "$?"
+  local -a required=()
+  [[ "$update_python" == 0 ]] || required+=(pyproject.toml uv.lock)
+  [[ "$update_node" == 0 ]] || required+=(package.json package-lock.json)
+  [[ "$update_dashboard" == 0 ]] || required+=(web/package.json)
+  for manifest in "${required[@]}"; do
+    git -C "$repo" cat-file -e "$promoted:$manifest" 2>/dev/null || {
+      policy_error "selected deployment requires $manifest in the candidate"; return 78;
+    }
+  done
+  if [[ "$update_runtime" == 1 ]] && ! runtime_services_in_scope; then
+    if [[ -d "$state_dir/runtime-repair" ]] || ! /usr/bin/python3 "$state_helper" runtime-check "$repo"; then
+      policy_error 'runtime repair requires maintenance of all active Hermes services; adjust scope or turn runtime off'; return 78
+    fi
+  fi
+  if [[ -x "$repo/venv/bin/python" && "$update_python" == 0 ]] \
+    && ! git -C "$repo" diff --quiet "$previous" "$promoted" -- pyproject.toml uv.lock; then
+    policy_error 'Python dependencies changed while python=off; enable Python updates before promotion'; return 78
+  fi
+  if [[ -d "$repo/node_modules" && "$update_node" == 0 ]] \
+    && ! git -C "$repo" diff --quiet "$previous" "$promoted" -- package.json package-lock.json '*/package.json' '*/package-lock.json' .npmrc; then
+    policy_error 'Node dependencies changed while node=off; enable Node updates before promotion'; return 78
+  fi
+}
+
+invalidate_update_caches() {
+  local home
+  for home in "${selected_profile_homes[@]}"; do rm -f -- "$home/.update_check"; done
+}
+
+runtime_services_in_scope() {
+  ((${#active_gateway_units[@]} == ${#deployment_profiles[@]})) \
+    && { [[ "$dashboard_shares_runtime" == 0 ]] || [[ "$dashboard_was_active" == 1 && "$update_dashboard" == 1 ]]; }
+}
+
+repair_production_runtime() {
+  [[ "$update_runtime" == 1 ]] || return 0
+  if [[ ! -d "$state_dir/runtime-repair" ]] && /usr/bin/python3 "$state_helper" runtime-check "$repo"; then return 0; fi
+  # A runtime swap cannot safely leave a running user-excluded service on the old environment.
+  if ! runtime_services_in_scope; then
+    policy_error 'runtime repair requires maintenance of all active Hermes services; adjust scope or turn runtime off'; return 78
+  fi
+  local -a stop_units=("${deployment_profiles[@]}")
+  [[ "$dashboard_was_active" == 0 ]] || stop_units+=(hermes-dashboard.service)
+  ((${#stop_units[@]} == 0)) || systemctl --user stop "${stop_units[@]}" || return 69
+  local uv_bin="${deployment_uv:-$(command -v uv || true)}"
+  [[ -n "$uv_bin" || ! -x "$update_home/bin/uv" ]] || uv_bin="$update_home/bin/uv"
+  [[ -n "$uv_bin" ]] || { policy_error 'runtime repair requires uv'; return 69; }
+  PATH="$(dirname "$uv_bin"):$PATH" HERMES_HOME="$update_home" timeout --signal=TERM --kill-after=30s 15m \
+    /usr/bin/python3 "$state_helper" runtime-repair "$repo" --state "$state_dir" || return 69
+}
+
+deploy_production() {
+  local previous_sha="$1" promoted_sha="$2"
+  if [[ -n "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
+    (cd "$repo" && bash -lc "$HERMES_UPDATE_DEPLOY_COMMAND"); return
+  fi
+  load_deployment_profiles "$previous_sha" || return "$?"
+  local uv_bin="${deployment_uv:-}" extra home
+  if [[ "$update_python" == 1 ]]; then
+    uv_bin="${uv_bin:-$(command -v uv || true)}"
+    [[ -n "$uv_bin" || ! -x "$update_home/bin/uv" ]] || uv_bin="$update_home/bin/uv"
+    [[ -n "$uv_bin" ]] || { policy_error 'Python updates require uv'; return 69; }
+    local -a extras=() names=()
+    IFS=',' read -r -a names <<<"${HERMES_UPDATE_EXTRAS:-}"
+    for extra in "${names[@]}"; do [[ -z "$extra" ]] || extras+=(--extra "$extra"); done
+    # Inexact preserves separately installed integrations; extras are explicit opt-ins.
+    UV_PROJECT_ENVIRONMENT="$repo/venv" "$uv_bin" sync --project "$repo" --inexact --locked --no-default-groups "${extras[@]}" || return 69
+    "$uv_bin" pip check --python "$repo/venv/bin/python" || return 69
+  fi
+  if [[ "$update_node" == 1 ]]; then
+    (cd "$repo" && run_verifier_npm ci --no-audit --no-fund) || return 69
+  fi
+  if [[ "$update_dashboard" == 1 ]]; then
+    (cd "$repo" && run_verifier_npm run build --workspace web) || return 69
+  fi
+  repair_production_runtime || return "$?"
+  if [[ "$update_migrate" == 1 ]]; then
+    for home in "${selected_profile_homes[@]}"; do
+      [[ -f "$home/config.yaml" ]] || continue
+      (cd "$repo" && HERMES_HOME="$home" "$repo/venv/bin/python" -m hermes_cli.main config migrate </dev/null) || return 69
+    done
+  fi
+  invalidate_update_caches
+  local unit
+  for unit in "${deployment_profiles[@]}"; do systemctl --user restart "$unit" || return 69; done
+  if [[ "$update_dashboard" == 1 && "$dashboard_was_active" == 1 ]]; then
+    systemctl --user restart hermes-dashboard.service || return 69
+  fi
+}
+
+verify_profile_code() {
+  local expected="$1" unit pid
+  for unit in "${deployment_profiles[@]}"; do
+    systemctl --user is-active --quiet "$unit" || return 1
+    pid="$(systemctl --user show "$unit" -p MainPID --value)" || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    profile_home_for_unit "$unit"
+    /usr/bin/python3 - "$profile_home/gateway_state.json" "$expected" "$pid" "$repo" <<'PY' || return 1
+import ast, json, pathlib, sys
+path, expected, pid, repo = sys.argv[1:]
+# Detect the upstream receipt API without importing gateway code or loading credentials.
+try:
+    status_module = pathlib.Path(repo) / 'gateway/status.py'
+    strings = set()
+    if status_module.is_file():
+        strings = {node.value for node in ast.walk(ast.parse(status_module.read_text()))
+                   if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+    if not pathlib.Path(path).exists():
+        raise SystemExit(1 if 'gateway_state.json' in strings else 0)
+    state = json.loads(pathlib.Path(path).read_text())
+    assert isinstance(state, dict)
+    assert state.get('pid') == int(pid)
+    assert state.get('gateway_state') == 'running'
+    if 'code_sha' in strings or 'code_sha' in state:
+        assert state.get('code_sha') == expected
+except (OSError, ValueError, SyntaxError, AssertionError):
+    raise SystemExit(1)
+PY
+  done
+}
+
+verify_production_health() {
+  if [[ -n "${HERMES_UPDATE_HEALTH_COMMAND:-}" ]]; then
+    (cd "$repo" && bash -lc "$HERMES_UPDATE_HEALTH_COMMAND"); return
+  fi
+  resolve_update_policy || return "$?"
+  if [[ "$update_python" == 1 ]]; then
+    (cd "$repo" && HERMES_HOME="$update_home" HERMES_DISABLE_LAZY_INSTALLS=1 PYTHONDONTWRITEBYTECODE=1 \
+      "$repo/venv/bin/python" -c 'import hermes_cli.main') || return 69
+  fi
+  if [[ "$update_runtime" == 1 ]]; then /usr/bin/python3 "$state_helper" runtime-check "$repo" || return 69; fi
+  local expected_sha attempt
+  expected_sha="$(git -C "$repo" rev-parse HEAD)" || return 1
+  for ((attempt=0; attempt<60; attempt++)); do
+    if verify_profile_code "$expected_sha" && { [[ "$update_dashboard" == 0 || "$dashboard_was_active" == 0 ]] \
+      || systemctl --user is-active --quiet hermes-dashboard.service; }; then return 0; fi
+    sleep 1
+  done
+  printf 'selected service health checks failed after 60 attempts\n' >&2
+  return 1
+}

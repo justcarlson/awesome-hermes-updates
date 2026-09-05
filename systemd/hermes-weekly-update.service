@@ -2,15 +2,12 @@
 Description=Awesome Hermes Updates: verified update and recovery
 After=network-online.target
 Wants=network-online.target
-ConditionPathIsDirectory=%h/.hermes/hermes-agent/.git
 StartLimitIntervalSec=10min
 StartLimitBurst=6
 
 [Service]
 Type=oneshot
-EnvironmentFile=-%h/.config/awesome-hermes-updates/config
-Environment="PATH=%h/.hermes/hermes-agent/venv/bin:%h/.hermes/node/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="HERMES_UPDATE_TEST_WORKERS=4"
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=%h/.local/bin/hermes-weekly-update
 Restart=on-failure
 RestartSec=2min
@@ -29,7 +26,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.hermes %h/.cache %h/.local/state %h/.npm %h/.codex
+ReadWritePaths=-%h/.hermes -%h/.cache %h/.local/state -%h/.npm -%h/.codex
 ReadWritePaths=%h/.config/systemd/user
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 

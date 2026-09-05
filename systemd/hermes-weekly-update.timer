@@ -1,8 +1,10 @@
 [Unit]
-Description=Run the verified Hermes upstream promotion every Sunday
+Description=Run scheduled Hermes Agent updates
 
 [Timer]
-OnCalendar=Sun *-*-* 03:15:00 America/New_York
+# The installer writes the user-selected calendar in schedule.conf.
+# Fresh installations leave this timer disabled (on demand).
+OnCalendar=daily
 Persistent=true
 AccuracySec=1min
 Unit=hermes-weekly-update.service

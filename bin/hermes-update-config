@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Safe configuration shared by installation, the CLI, and the controller."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+COMPONENTS = ('PYTHON', 'NODE', 'DASHBOARD', 'GATEWAY', 'MIGRATE', 'RUNTIME')
+DEFAULTS = {**{f'HERMES_UPDATE_{name}': 'auto' for name in COMPONENTS},
+            'HERMES_UPDATE_MAX_REPAIRS': '0', 'HERMES_UPDATE_EXTRAS': '',
+            'HERMES_UPDATE_PROFILES': 'auto', 'HERMES_UPDATE_REF': 'main',
+            'HERMES_UPDATE_TEST_WORKERS': '4', 'HERMES_UPDATE_SCHEDULE': 'on-demand'}
+ADVANCED = ('DASHBOARD_HOST', 'DEPLOY_COMMAND', 'HEALTH_COMMAND', 'REPAIR_COMMAND',
+            'VERIFY_COMMAND', 'NPM_VERSION', 'TARGET_SHA')
+ALLOWED = set(DEFAULTS) | {f'HERMES_UPDATE_{key}' for key in ADVANCED} | {
+    'HERMES_UPDATE_HOME', 'HERMES_UPDATE_REPO', 'HERMES_UPDATE_STATE_DIR'}
+
+
+def config_path(home=None):
+    return Path(home or Path.home()) / '.config/awesome-hermes-updates/config'
+
+
+def read_config(path):
+    values = {}
+    if not path.exists():
+        return values
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, separator, raw = line.partition('=')
+        if not separator or key not in ALLOWED:
+            raise ValueError(f'{path}:{number}: unknown setting or invalid assignment: {key}')
+        if key in values:
+            raise ValueError(f'{path}:{number}: duplicate setting: {key}')
+        parts = shlex.split(raw, comments=False, posix=True)
+        if len(parts) > 1:
+            raise ValueError(f'{path}:{number}: quote values containing spaces')
+        values[key] = parts[0] if parts else ''
+    return values
+
+
+def effective(values, home=None, environ=None):
+    home = Path(home or Path.home())
+    environ = os.environ if environ is None else environ
+    settings = dict(DEFAULTS)
+    settings.update(values)
+    settings.update({key: value for key, value in environ.items() if key in ALLOWED})
+    settings.setdefault('HERMES_UPDATE_HOME', environ.get('HERMES_HOME', str(home / '.hermes')))
+    settings.setdefault('HERMES_UPDATE_REPO', str(Path(settings['HERMES_UPDATE_HOME']) / 'hermes-agent'))
+    settings.setdefault('HERMES_UPDATE_STATE_DIR', str(home / '.local/state/hermes-weekly-update'))
+    for key, value in settings.items():
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError(f'{key}: control characters are not allowed')
+    for component in COMPONENTS:
+        key = f'HERMES_UPDATE_{component}'
+        if settings[key] not in ('auto', 'on', 'off'):
+            raise ValueError(f'{key} must be auto, on, or off')
+    for key, lower, upper in (('HERMES_UPDATE_MAX_REPAIRS', 0, 20), ('HERMES_UPDATE_TEST_WORKERS', 1, 64)):
+        if not re.fullmatch(r'0|[1-9][0-9]*', settings[key]) or not lower <= int(settings[key]) <= upper:
+            raise ValueError(f'{key} must be between {lower} and {upper}')
+    for key in ('HERMES_UPDATE_HOME', 'HERMES_UPDATE_REPO', 'HERMES_UPDATE_STATE_DIR'):
+        value = settings[key]
+        if value.startswith('~/'):
+            value = str(home / value[2:])
+        if not Path(value).is_absolute():
+            raise ValueError(f'{key} must be an absolute path (or start with ~/)')
+        settings[key] = str(Path(value).resolve())
+    for key, pattern, special in (
+        ('HERMES_UPDATE_EXTRAS', r'[A-Za-z0-9][A-Za-z0-9_.-]*', ''),
+        ('HERMES_UPDATE_PROFILES', r'[A-Za-z0-9_-]+', 'auto'),
+    ):
+        value = settings[key]
+        if value != special:
+            parts = value.split(',')
+            if not all(re.fullmatch(pattern, part) for part in parts) or len(set(parts)) != len(parts):
+                raise ValueError(f'{key} must be a comma-separated list of unique names')
+    if not settings['HERMES_UPDATE_REF'] or settings['HERMES_UPDATE_REF'].startswith('-'):
+        raise ValueError('HERMES_UPDATE_REF must be a Git ref')
+    if 'HERMES_UPDATE_TARGET_SHA' in settings and not re.fullmatch(r'[0-9a-f]{40}', settings['HERMES_UPDATE_TARGET_SHA']):
+        raise ValueError('HERMES_UPDATE_TARGET_SHA must be a full commit SHA')
+    if not settings['HERMES_UPDATE_SCHEDULE']:
+        raise ValueError('schedule must be on-demand or a systemd calendar expression')
+    return settings
+
+
+def prepare_runtime_dirs(home, settings):
+    # Optional writable mounts cannot create their missing parent under
+    # ProtectHome=read-only. Prepare caches before entering the service sandbox.
+    for path in [Path(home) / name for name in ('.cache', '.npm', '.codex', '.local/state')]:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    Path(settings['HERMES_UPDATE_STATE_DIR']).mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+def timer_calendars(home, use_systemd=False):
+    unit = Path(home) / '.config/systemd/user/hermes-weekly-update.timer'
+    if use_systemd:
+        content = subprocess.run(['systemctl', '--user', 'cat', 'hermes-weekly-update.timer'],
+                                 check=True, capture_output=True, text=True).stdout
+    else:
+        files = [unit, *sorted(unit.with_name(unit.name + '.d').glob('*.conf'))]
+        content = '\n'.join(path.read_text() for path in files)
+    calendars, section = [], ''
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            section = line
+        elif section == '[Timer]' and line.startswith('OnCalendar='):
+            value = line.partition('=')[2].strip()
+            if value:
+                if value not in calendars:
+                    calendars.append(value)
+            else:
+                calendars = []
+    return calendars
+
+
+def runtime_environment(settings, environ=None):
+    environment = dict(os.environ if environ is None else environ)
+    environment.update(settings)
+    environment['HERMES_UPDATE_CONFIG_LOADED'] = '1'
+    # Hermes may bundle its tools outside the interactive shell's PATH.
+    directories = [str(Path(settings['HERMES_UPDATE_REPO']) / 'venv/bin'),
+                   str(Path(settings['HERMES_UPDATE_HOME']) / 'node/bin'),
+                   str(Path(settings['HERMES_UPDATE_HOME']) / 'bin')]
+    environment['PATH'] = ':'.join([*directories, environment.get('PATH', '/usr/local/bin:/usr/bin:/bin')])
+    return environment
+
+
+def validate_calendar(calendar):
+    if calendar == 'on-demand':
+        return
+    try:
+        subprocess.run(['systemd-analyze', 'calendar', '--', calendar], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as error:
+        raise ValueError('systemd-analyze is required to validate a schedule') from error
+    except subprocess.CalledProcessError as error:
+        raise ValueError(f'invalid schedule: {calendar}: {error.stderr.strip()}') from error
+
+
+def atomic_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as output:
+            output.write(content)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def write_config(path, values):
+    atomic_write(path, '# Awesome Hermes Updates. Literal values; no shell expansion.\n' +
+                 ''.join(f'{key}={json.dumps(value, ensure_ascii=False)}\n' for key, value in sorted(values.items())))
+
+
+@contextmanager
+def settings_lock(settings, reject_pending=True):
+    state = Path(settings['HERMES_UPDATE_STATE_DIR'])
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (state / 'update.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError('an update is running; change settings after it stops') from error
+        if reject_pending and any((state / name).exists() for name in ('repair-pending', 'promotion-pending')):
+            raise ValueError('an update is pending; finish recovery before changing settings')
+        yield
+
+
+def unit_path(value):
+    # Unit specifiers expand even inside quotes.
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+
+
+def write_units(home, settings):
+    directory = Path(home) / '.config/systemd/user'
+    writable = [settings[key] for key in ('HERMES_UPDATE_HOME', 'HERMES_UPDATE_REPO', 'HERMES_UPDATE_STATE_DIR')]
+    atomic_write(directory / 'hermes-weekly-update.service.d/paths.conf',
+                 '[Service]\nReadWritePaths=' + ' '.join(unit_path('-' + path) for path in writable) + '\n')
+    atomic_write(directory / 'hermes-weekly-update-recovery.service.d/paths.conf',
+                 '[Unit]\nConditionPathExistsGlob=\nConditionPathExistsGlob=' +
+                 unit_path(str(Path(settings['HERMES_UPDATE_STATE_DIR']) / '*-pending')) + '\n')
+    calendar = settings['HERMES_UPDATE_SCHEDULE']
+    atomic_write(directory / 'hermes-weekly-update.timer.d/schedule.conf',
+                 '[Timer]\nOnCalendar=\n' + (f'OnCalendar={calendar.replace("%", "%%")}\n' if calendar != 'on-demand' else 'OnCalendar=daily\n'))
+
+
+def systemctl(*arguments):
+    subprocess.run(['systemctl', '--user', *arguments], check=True)
+
+
+def check_user_manager():
+    subprocess.run(['systemctl', '--user', 'show-environment'], check=True, stdout=subprocess.DEVNULL)
+
+
+def apply_schedule(settings):
+    systemctl('daemon-reload')
+    if settings['HERMES_UPDATE_SCHEDULE'] == 'on-demand':
+        systemctl('disable', '--now', 'hermes-weekly-update.timer')
+    else:
+        systemctl('enable', '--now', 'hermes-weekly-update.timer')
+        systemctl('restart', 'hermes-weekly-update.timer')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['launch'])
+    args, rest = parser.parse_known_args()
+    try:
+        settings = effective(read_config(config_path()))
+        environment = runtime_environment(settings)
+        controller = Path(__file__).resolve().with_name('hermes-weekly-update')
+        os.execve(controller, [str(controller), *rest], environment)
+    except (ValueError, OSError) as error:
+        print(f'BLOCKED {error}', file=sys.stderr)
+        return 78
+
+
+if __name__ == '__main__':
+    sys.exit(main())
