@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 import fcntl
+import glob
 import json
 import os
 from pathlib import Path
@@ -187,9 +188,10 @@ def write_units(home, settings):
     writable = [settings[key] for key in ('HERMES_UPDATE_HOME', 'HERMES_UPDATE_REPO', 'HERMES_UPDATE_STATE_DIR')]
     atomic_write(directory / 'hermes-weekly-update.service.d/paths.conf',
                  '[Service]\nReadWritePaths=' + ' '.join(unit_path('-' + path) for path in writable) + '\n')
+    # Conditions take a scalar path: quotes are literal, unlike ReadWritePaths.
     atomic_write(directory / 'hermes-weekly-update-recovery.service.d/paths.conf',
                  '[Unit]\nConditionPathExistsGlob=\nConditionPathExistsGlob=' +
-                 unit_path(str(Path(settings['HERMES_UPDATE_STATE_DIR']) / '*-pending')) + '\n')
+                 glob.escape(settings['HERMES_UPDATE_STATE_DIR']).replace('%', '%%') + '/*-pending\n')
     calendar = settings['HERMES_UPDATE_SCHEDULE']
     atomic_write(directory / 'hermes-weekly-update.timer.d/schedule.conf',
                  '[Timer]\nOnCalendar=\n' + (f'OnCalendar={calendar.replace("%", "%%")}\n' if calendar != 'on-demand' else 'OnCalendar=daily\n'))
