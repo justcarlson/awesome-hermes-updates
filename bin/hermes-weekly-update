@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+package_bin="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+if [[ "${HERMES_UPDATE_CONFIG_LOADED:-}" != 1 ]]; then
+  exec /usr/bin/python3 "$package_bin/hermes-update-config" launch "$@"
+fi
+
 repo="${HERMES_UPDATE_REPO:-$HOME/.hermes/hermes-agent}"
 state_dir="${HERMES_UPDATE_STATE_DIR:-$HOME/.local/state/hermes-weekly-update}"
 verifier_npm_version="${HERMES_UPDATE_NPM_VERSION:-12.0.2}"
@@ -13,21 +18,21 @@ keep_candidate=0
 target_sha=""
 production_sha=""
 mode="promote"
-max_repairs="${HERMES_UPDATE_MAX_REPAIRS:-4}"
+max_repairs="${HERMES_UPDATE_MAX_REPAIRS:-0}"
 profiles_file="$state_dir/deployment-profiles"
 state_helper="$(dirname "${BASH_SOURCE[0]}")/hermes-update-state"
 if [[ ! -f "$state_helper" ]]; then
   state_helper="$(dirname "${BASH_SOURCE[0]}")/executable_hermes-update-state"
 fi
 state_helper="$(realpath "$state_helper")"
-updater_digest="$(cat "${BASH_SOURCE[0]}" "$state_helper" | sha256sum | cut -d ' ' -f 1)"
+updater_digest="$(cat "$package_bin"/hermes-* | sha256sum | cut -d ' ' -f 1)"
 
-if [[ "${1:-}" == "--check" ]]; then
-  mode="check"
+if [[ "${1:-}" == "--check" || "${1:-}" == "--plan" ]]; then
+  mode="${1#--}"
   shift
 fi
 if (($#)); then
-  printf 'usage: hermes-weekly-update [--check]\n' >&2
+  printf 'usage: hermes-weekly-update [--check|--plan]\n' >&2
   exit 64
 fi
 
@@ -44,7 +49,7 @@ fi
 
 write_receipt() {
   local result=$?
-  if [[ "$mode" != check ]]; then
+  if [[ "$mode" == promote ]]; then
     {
       printf 'finished=%s\nexit_status=%s\n' "$(date -u +%FT%TZ)" "$result"
       printf 'production=%s\ntarget=%s\ncandidate=%s\n' "$production_sha" "$target_sha" "$candidate"
@@ -59,20 +64,10 @@ write_receipt() {
 }
 trap write_receipt EXIT
 
-if [[ ! -d "$repo/.git" ]]; then
+if [[ ! -e "$repo/.git" ]]; then
   printf 'BLOCKED Hermes repository not found at %s\n' "$repo" >&2
   exit 66
 fi
-
-invalidate_update_caches() {
-  local cache
-
-  rm -f -- "$HOME/.hermes/.update_check"
-  for cache in "$HOME"/.hermes/profiles/*/.update_check; do
-    [[ -e "$cache" ]] || continue
-    rm -f -- "$cache"
-  done
-}
 
 ensure_verifier_npm() {
   local actual_version=""
@@ -312,47 +307,6 @@ validate_promotion_pending() {
   fi
 }
 
-load_deployment_profiles() {
-  local previous="$1"
-  local inventory unit
-  local -a saved
-  if [[ ! -f "$profiles_file" ]]; then
-    inventory="$(systemctl --user list-units 'hermes-gateway*.service' \
-      --state=active,activating,reloading --plain --no-legend --no-pager)" || return 1
-    {
-      printf '%s\n' "$previous" 'hermes-gateway.service'
-      awk '$1 ~ /^hermes-gateway-.+\.service$/ {print $1}' <<<"$inventory"
-    } >"$profiles_file.tmp.$$"
-    mv -f -- "$profiles_file.tmp.$$" "$profiles_file"
-  fi
-  mapfile -t saved <"$profiles_file"
-  if [[ "${saved[0]:-}" != "$previous" || "${saved[1]:-}" != hermes-gateway.service ]]; then
-    printf 'BLOCKED deployment profile inventory does not match production\n' >&2
-    return 78
-  fi
-  deployment_profiles=("${saved[@]:1}")
-  for unit in "${deployment_profiles[@]}"; do
-    if [[ ! "$unit" =~ ^hermes-gateway(-[A-Za-z0-9_-]+)?\.service$ ]]; then
-      printf 'BLOCKED invalid deployment profile unit: %s\n' "$unit" >&2
-      return 78
-    fi
-    profile_home_for_unit "$unit"
-    if [[ ! -d "$profile_home" ]]; then
-      printf 'BLOCKED profile home is missing: %s\n' "$profile_home" >&2
-      return 78
-    fi
-  done
-}
-
-profile_home_for_unit() {
-  local unit="$1"
-  profile_home="$HOME/.hermes"
-  if [[ "$unit" != hermes-gateway.service ]]; then
-    local profile="${unit#hermes-gateway-}"
-    profile_home="$HOME/.hermes/profiles/${profile%.service}"
-  fi
-}
-
 recover_test_artifacts() {
   local blocked="$candidate/.git/hermes-repair-blocked"
   [[ "$repair_phase" == verify ]] || return 0
@@ -470,6 +424,7 @@ retire_failed_target() {
   printf 'previous_target=%s\nnext_target=%s\ncandidate=%s\n' \
     "$target_sha" "$next_target" "$candidate" >"$rejected/transition"
   cp "$repair_pending_file" "$rejected/repair-pending"
+  if [[ -f "$profiles_file" ]]; then mv "$profiles_file" "$rejected/deployment-profiles"; fi
   printf 'REJECTED_TARGET_ARCHIVED target=%s next=%s evidence=%s\n' "$target_sha" "$next_target" "$rejected"
   target_sha="$next_target"
   write_repair_pending selected - - -
@@ -477,20 +432,6 @@ retire_failed_target() {
   # covers a crash after archival: no old state is removed or overwritten.
   export HERMES_UPDATE_TARGET_SHA="$next_target"
   exec "$0"
-}
-
-verify_profile_code() {
-  local expected="$1"
-  local unit pid
-  for unit in "${deployment_profiles[@]}"; do
-    systemctl --user is-active --quiet "$unit" || return 1
-    pid="$(systemctl --user show "$unit" -p MainPID --value)" || return 1
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    profile_home_for_unit "$unit"
-    jq -e --arg sha "$expected" --argjson pid "$pid" \
-      '.code_sha == $sha and .pid == $pid and .gateway_state == "running"' \
-      "$profile_home/gateway_state.json" >/dev/null 2>&1 || return 1
-  done
 }
 
 bounded_deploy() {
@@ -506,99 +447,22 @@ bounded_deploy() {
   deploy_production "$previous" "$promoted"
 }
 
-repair_production_runtime() {
-  if [[ ! -d "$state_dir/runtime-repair" ]] \
-    && /usr/bin/python3 "$state_helper" runtime-check "$repo"; then return 0; fi
-  printf 'RUNTIME_MAINTENANCE_REQUIRED source=%s\n' "$(git -C "$repo" rev-parse HEAD)"
-  systemctl --user stop "${deployment_profiles[@]}" hermes-dashboard.service || return 69
-  HERMES_HOME="$HOME/.hermes" timeout --signal=TERM --kill-after=30s 15m \
-    /usr/bin/python3 "$state_helper" runtime-repair "$repo" --state "$state_dir" || return 69
-}
+if [[ "$mode" == promote && -f "$profiles_file" && ! -f "$repair_pending_file" && ! -f "$pending_file" ]]; then
+  mv -- "$profiles_file" "$profiles_file.unused.$(date +%s).$$"
+fi
 
-deploy_production() {
-  local previous_sha="$1"
-  local promoted_sha="$2"
+# Deployment policy is independent of target selection and candidate recovery.
+source "$package_bin/hermes-update-deployment"
 
-  if [[ -n "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
-    (cd "$repo" && bash -lc "$HERMES_UPDATE_DEPLOY_COMMAND")
-    return
-  fi
-
-  local uv_bin
-  uv_bin="$(command -v uv || true)"
-  if [[ -z "$uv_bin" && -x "$HOME/.hermes/bin/uv" ]]; then
-    uv_bin="$HOME/.hermes/bin/uv"
-  fi
-  if ! git -C "$repo" diff --quiet "$previous_sha" "$promoted_sha" -- pyproject.toml uv.lock; then
-    [[ -n "$uv_bin" ]] || { printf 'uv is required for deployment\n' >&2; return 69; }
-    UV_PROJECT_ENVIRONMENT="$repo/venv" "$uv_bin" sync \
-      --project "$repo" --inexact --extra all --locked
-    "$uv_bin" pip check --python "$repo/venv/bin/python"
-  fi
-  if ! git -C "$repo" diff --quiet "$previous_sha" "$promoted_sha" -- \
-    package.json package-lock.json '*/package.json' '*/package-lock.json' .npmrc; then
-    (cd "$repo" && run_verifier_npm ci --no-audit --no-fund)
-  fi
-  if ! git -C "$repo" diff --quiet "$previous_sha" "$promoted_sha" -- \
-    web apps/shared package.json package-lock.json .npmrc tsconfig.json; then
-    (cd "$repo" && run_verifier_npm run build --workspace web)
-  fi
-  load_deployment_profiles "$previous_sha"
-  repair_production_runtime || return "$?"
-  local unit
-  for unit in "${deployment_profiles[@]}"; do
-    profile_home_for_unit "$unit"
-    (cd "$repo" && HERMES_HOME="$profile_home" "$repo/venv/bin/python" \
-      -m hermes_cli.main config migrate </dev/null)
-    (cd "$repo" && HERMES_HOME="$profile_home" "$repo/venv/bin/python" -c '
-from hermes_cli.gateway import get_service_name, refresh_systemd_unit_if_needed, systemd_unit_is_current
-import sys
-assert get_service_name() + ".service" == sys.argv[1], "profile service name mismatch"
-refresh_systemd_unit_if_needed()
-assert systemd_unit_is_current(), "gateway unit refresh failed"
-' "$unit")
-  done
-  invalidate_update_caches
-  systemctl --user restart hermes-gateway.service hermes-dashboard.service
-  for unit in "${deployment_profiles[@]}"; do
-    [[ "$unit" == hermes-gateway.service ]] && continue
-    systemctl --user restart "$unit"
-  done
-}
-
-verify_production_health() {
-  if [[ -n "${HERMES_UPDATE_HEALTH_COMMAND:-}" ]]; then
-    (cd "$repo" && bash -lc "$HERMES_UPDATE_HEALTH_COMMAND")
-    return
-  fi
-
-  /usr/bin/python3 "$state_helper" runtime-check "$repo" || return 69
-  local dashboard_host="${HERMES_UPDATE_DASHBOARD_HOST:-127.0.0.1}"
-  local expected_sha
-  expected_sha="$(git -C "$repo" rev-parse HEAD)"
-  for _ in $(seq 1 60); do
-    if verify_profile_code "$expected_sha" \
-      && systemctl --user is-active --quiet hermes-dashboard.service \
-      && curl -fsS --max-time 5 http://127.0.0.1:8644/health \
-        | jq -e '.status == "ok"' >/dev/null \
-      && curl -fsS --max-time 5 "http://$dashboard_host:9119/api/health" \
-        | jq -e '.ok == true' >/dev/null \
-      && curl -fsS --max-time 5 "http://$dashboard_host:9119/api/status" \
-        | jq -e '
-          .gateway_running == true and
-          .gateway_state == "running" and
-          .components.gateway.status == "ok" and
-          .components.dashboard.status == "ok" and
-          .components.storage.status == "ok" and
-          .config_version == .latest_config_version
-        ' >/dev/null; then
-        return
-    fi
-    sleep 1
-  done
-  printf 'production health gate failed after 60 attempts\n' >&2
-  return 1
-}
+if [[ "$mode" == plan ]]; then
+  resolve_update_policy
+  printf 'Resolved actions: python=%s node=%s dashboard=%s gateway=%s migrate=%s runtime=%s\n' \
+    "$update_python" "$update_node" "$update_dashboard" "$update_gateway" "$update_migrate" "$update_runtime"
+  printf 'Selected profile homes:'; printf ' %s' "${selected_profile_homes[@]}"; printf '\n'
+  printf 'Running gateways selected for restart:'; printf ' %s' "${deployment_profiles[@]}"; printf '\n'
+  printf 'Running dashboard selected for restart: %s\n' "$((update_dashboard * dashboard_was_active))"
+  exit 0
+fi
 
 if [[ -f "$pending_file" ]]; then
   validate_promotion_pending
@@ -619,6 +483,10 @@ if [[ -f "$pending_file" ]]; then
     printf 'PROMOTION_PENDING previous=%s target=%s candidate=%s\n' \
       "$pending_previous" "$pending_target" "$pending_candidate"
     exit 0
+  fi
+  if [[ -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
+    load_deployment_profiles "$pending_previous"
+    preflight_deployment "$pending_previous" "$pending_candidate"
   fi
   if [[ "$current_head" == "$pending_previous" ]]; then
     git -C "$repo" merge --ff-only "$pending_candidate"
@@ -643,6 +511,9 @@ fi
 production_sha="$(git -C "$repo" rev-parse HEAD)"
 if [[ -f "$repair_pending_file" ]]; then
   load_repair_pending
+  if [[ "$mode" != check && -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
+    load_deployment_profiles "$production_sha"
+  fi
   if [[ "$production_sha" != "$repair_production" ]]; then
     printf 'BLOCKED production HEAD changed during pending repair\n' >&2
     exit 75
@@ -715,10 +586,10 @@ else
 
   if git -C "$repo" merge-base --is-ancestor "$target_sha" "$production_sha"; then
     if [[ "$mode" != check ]]; then
-      if [[ -z "${HERMES_UPDATE_HEALTH_COMMAND:-}" ]]; then
-        load_deployment_profiles "$production_sha"
+      if [[ -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" || -z "${HERMES_UPDATE_HEALTH_COMMAND:-}" ]]; then
+        resolve_update_policy
       fi
-      if [[ -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]] \
+      if [[ -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" && "$update_runtime" == 1 ]] \
         && { [[ -d "$state_dir/runtime-repair" ]] \
           || ! /usr/bin/python3 "$state_helper" runtime-check "$repo"; }; then
         load_deployment_profiles "$production_sha"
@@ -736,6 +607,10 @@ else
   printf 'UPDATE_AVAILABLE production=%s target=%s\n' "$production_sha" "$target_sha"
   if [[ "$mode" == "check" ]]; then
     exit 0
+  fi
+  if [[ -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
+    preflight_deployment "$production_sha" "$target_sha"
+    load_deployment_profiles "$production_sha"
   fi
   write_repair_pending "selected" "-" "-" "-"
   repair_phase="selected"
@@ -761,10 +636,10 @@ if [[ -z "$candidate" ]]; then
   candidate="$(mktemp -d "$state_dir/candidate.XXXXXX")"
   git clone --quiet --shared "$repo" "$candidate"
   git -C "$candidate" config user.name \
-    "$(git -C "$repo" config user.name || printf 'Hermes weekly updater')"
+    "$(git -C "$repo" config user.name || printf 'Hermes updater')"
   git -C "$candidate" config user.email \
     "$(git -C "$repo" config user.email || printf 'hermes-updater@localhost')"
-  git -C "$candidate" checkout --quiet -b fleet-update-candidate "$production_sha"
+  git -C "$candidate" checkout --quiet -b hermes-update-candidate "$production_sha"
   write_repair_pending "merge" "$candidate" "$production_sha" "-"
   repair_phase="merge"
   repair_checkpoint="$production_sha"
@@ -888,8 +763,8 @@ verify_candidate() {
 
   local uv_bin
   uv_bin="$(command -v uv || true)"
-  if [[ -z "$uv_bin" && -x "$HOME/.hermes/bin/uv" ]]; then
-    uv_bin="$HOME/.hermes/bin/uv"
+  if [[ -z "$uv_bin" && -x "${HERMES_UPDATE_HOME:-$HOME/.hermes}/bin/uv" ]]; then
+    uv_bin="${HERMES_UPDATE_HOME:-$HOME/.hermes}/bin/uv"
   fi
   if [[ -z "$uv_bin" ]]; then
     printf 'uv is required for candidate verification\n' >&2
@@ -904,7 +779,7 @@ verify_candidate() {
     cd "$candidate" || exit "$?"
     # Dependency installation depends on its manifests, configuration and setup
     # scripts. Test results also depend on the full source tree and interpreter.
-    toolchain_key="locked-deps-v2:$verifier_npm_version:$(node --version 2>/dev/null):$($uv_bin --version)"
+    toolchain_key="locked-deps-v3:$verifier_npm_version:$(node --version 2>/dev/null):$($uv_bin --version)"
     python_request=3.11
     [[ ! -x "$repo/venv/bin/python" ]] || python_request="$repo/venv/bin/python"
     python_deps_key="$toolchain_key:$(readlink -f "$python_request" 2>/dev/null || printf '%s' "$python_request"):$(git ls-files -s -- pyproject.toml uv.lock .python-version setup.py setup.cfg 'requirements*.txt' scripts | sha256sum | cut -d ' ' -f 1)"
@@ -914,21 +789,19 @@ verify_candidate() {
     if [[ ! -x "$candidate/venv/bin/python" \
       || "$(cat "$cache_dir/python-deps" 2>/dev/null || true)" != "$python_deps_key" ]]; then
     rm -f -- "$cache_dir/python-gate" "$candidate/.git/hermes-python-results.json" "$candidate/.git/hermes-python-results.jsonl"
+    local -a verification_extras=()
+    local extra
+    local manifest_extras
+    manifest_extras="$(/usr/bin/python3 "$state_helper" verification-extras "$candidate")" || exit 69
+    while IFS= read -r extra; do
+      [[ -z "$extra" ]] || verification_extras+=(--extra "$extra")
+    done <<<"$manifest_extras"
     UV_PROJECT_ENVIRONMENT="$candidate/venv" "$uv_bin" sync \
-      --python "$python_request" --locked \
-      --extra all \
-      --extra dev \
-      --extra anthropic \
-      --extra mistral \
-      --extra fal \
-      --extra modal \
-      --extra daytona \
-      --extra hindsight \
-      --extra parallel-web || exit 69
+      --python "$python_request" --locked "${verification_extras[@]}" || exit 69
     printf '%s\n' "$python_deps_key" >"$cache_dir/python-deps"
     fi
-    if [[ ! -d "$candidate/node_modules" \
-      || "$(cat "$cache_dir/node-deps" 2>/dev/null || true)" != "$node_deps_key" ]]; then
+    if [[ -f "$candidate/package.json" ]] && { [[ ! -d "$candidate/node_modules" ]] \
+      || [[ "$(cat "$cache_dir/node-deps" 2>/dev/null || true)" != "$node_deps_key" ]]; }; then
       rm -f -- "$cache_dir/python-gate" "$candidate/.git/hermes-python-results.json" "$candidate/.git/hermes-python-results.jsonl"
       run_verifier_npm ci --no-audit --no-fund || exit 69
       printf '%s\n' "$node_deps_key" >"$cache_dir/node-deps"
@@ -952,15 +825,19 @@ verify_candidate() {
       "$candidate/venv/bin/python" "$state_helper" verify "$candidate" || exit "$?"
     printf '%s\n' "$gate_key" >"$cache_dir/python-gate"
     fi
+    if [[ -f "$candidate/package.json" ]]; then
     ensure_verifier_npm || exit 69
     /usr/bin/python3 "$state_helper" isolate env -i HOME="$test_home" \
       PATH="$candidate/venv/bin:$(dirname "$verifier_npm_bin"):$PATH" \
       TZ=UTC LANG=C.UTF-8 CI=true \
       "$verifier_npm_bin" run check || exit "$?"
+    if [[ -f "$candidate/web/package.json" ]]; then
     /usr/bin/python3 "$state_helper" isolate env -i HOME="$test_home" \
       PATH="$candidate/venv/bin:$(dirname "$verifier_npm_bin"):$PATH" \
       TZ=UTC LANG=C.UTF-8 CI=true \
       "$verifier_npm_bin" run build --workspace web || exit "$?"
+    fi
+    fi
   )
 }
 
@@ -1092,6 +969,7 @@ fi
 git -C "$repo" fetch --quiet "$candidate" "$candidate_sha"
 if [[ -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
   load_deployment_profiles "$production_sha"
+  preflight_deployment "$production_sha" "$candidate_sha"
 fi
 promotion_tmp="$pending_file.tmp.$$"
 printf '%s %s %s\n' "$production_sha" "$target_sha" "$candidate_sha" \

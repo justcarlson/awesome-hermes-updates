@@ -1,6 +1,7 @@
 """Exercise unattended updater failures with local repositories and fake tools."""
 
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -23,7 +24,14 @@ def _update_case(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]:
     _git("config", "user.email", "updater@example.invalid", cwd=upstream)
     (upstream / "version.txt").write_text("one\n")
     (upstream / ".gitignore").write_text("venv/\nnode_modules/\n")
-    _git("add", "version.txt", ".gitignore", cwd=upstream)
+    (upstream / "pyproject.toml").write_text('[project]\nname = "fixture"\nversion = "0.0.1"\n')
+    (upstream / "package.json").write_text('{"scripts":{"check":"true"},"workspaces":["web"]}')
+    (upstream / "package-lock.json").write_text("{}")
+    (upstream / "web").mkdir()
+    (upstream / "web/package.json").write_text('{"name":"web","scripts":{"build":"true"}}')
+    (upstream / "scripts").mkdir()
+    (upstream / "scripts/run_tests_parallel.py").write_text('# fixture runner is supplied by fake Python\n')
+    _git("add", "version.txt", ".gitignore", "pyproject.toml", "package.json", "package-lock.json", "web", "scripts", cwd=upstream)
     _git("commit", "-m", "initial", cwd=upstream)
     _git("clone", str(upstream), str(production), cwd=tmp_path)
     _git("config", "user.name", "Updater test", cwd=production)
@@ -42,7 +50,7 @@ def _update_case(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]:
     }
     # Do not inherit a target or a repair budget from the operator's shell.
     env.pop("HERMES_UPDATE_TARGET_SHA", None)
-    env.pop("HERMES_UPDATE_MAX_REPAIRS", None)
+    env["HERMES_UPDATE_MAX_REPAIRS"] = "4"  # These tests explicitly exercise repair.
     env.pop("HERMES_UPDATE_REF", None)
     return upstream, production, home, env
 
@@ -119,6 +127,7 @@ def test_profile_snapshot_survives_failed_restart_and_requires_current_process(
     profile.mkdir(parents=True)
     for profile_home in (home / ".hermes", profile):
         (profile_home / ".update_check").write_text("stale")
+        (profile_home / "config.yaml").write_text("{}")
     control = home / "control"
     control.mkdir()
     (control / "fail-next-profile").touch()
@@ -156,7 +165,12 @@ def test_profile_snapshot_survives_failed_restart_and_requires_current_process(
         elif command == 'is-active':
             if 'hermes-gateway-alpha.service' in args and (control / 'inactive').exists(): sys.exit(3)
         elif command == 'show':
-            print('222' if 'hermes-gateway-alpha.service' in args else '111')
+            if '--property=Environment' in args:
+                root = Path(os.environ['HOME']) / '.hermes'
+                if 'hermes-gateway-alpha.service' in args: root = root / 'profiles/alpha'
+                print('Environment=VIRTUAL_ENV=' + os.environ['HERMES_UPDATE_REPO'] + '/venv HERMES_HOME=' + str(root))
+            else:
+                print('222' if 'hermes-gateway-alpha.service' in args else '111')
         else:
             sys.exit(90)
         """,
@@ -185,16 +199,20 @@ def test_profile_snapshot_survives_failed_restart_and_requires_current_process(
     env.pop("HERMES_UPDATE_HEALTH_COMMAND")
     env["PATH"] = f"{fake_bin}:{os.environ['PATH']}"
     env["FAKE_CONTROL"] = str(control)
+    env["HERMES_UPDATE_PYTHON"] = "off"
     if shared_only:
+        env["HERMES_UPDATE_NODE"] = "on"
+        env["HERMES_UPDATE_DASHBOARD"] = "on"
         events = _default_verifier_tools(home, env)
         env["HERMES_UPDATE_VERIFY_COMMAND"] = "/bin/true"
 
     failed = _run(env)
     assert failed.returncode != 0, failed.stdout + failed.stderr
     snapshot = home / "state" / "deployment-profiles"
-    assert snapshot.read_text().splitlines() == [
-        previous, "hermes-gateway.service", "hermes-gateway-alpha.service"
-    ]
+    assert snapshot.exists(), failed.stdout + failed.stderr
+    saved = json.loads(snapshot.read_text())
+    assert saved["previous"] == previous
+    assert saved["units"] == ["hermes-gateway-alpha.service"]
     assert (home / "state" / "promotion-pending").exists()
     assert (control / "inactive").exists()
     assert not (profile / ".update_check").exists()
@@ -219,7 +237,7 @@ def test_profile_snapshot_survives_failed_restart_and_requires_current_process(
     assert not (home / "state" / "promotion-pending").exists()
     if shared_only:
         assert _git("diff", "--name-only", previous, "HEAD", cwd=production) == "apps/shared/component.ts"
-        assert events.read_text().splitlines() == ["npm run build --workspace web"] * 2
+        assert events.read_text().splitlines() == ["npm ci --no-audit --no-fund", "npm run build --workspace web"] * 2
 
 
 def _default_verifier_tools(home: Path, env: dict[str, str]) -> Path:

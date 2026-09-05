@@ -1,20 +1,23 @@
 # Awesome Hermes Updates
 
-**Verified updates. Saved progress. Bounded recovery.**
+Verified updates for Hermes Agent, on demand or on your schedule.
 
-Update Hermes Agent on demand or on a schedule. Each run fixes one upstream
-commit as its target, tests a separate candidate, and promotes it only after
-verification. Failed checks can receive a bounded Codex repair. Interrupted
-work resumes from saved state. A fault that cannot be repaired stops with logs.
+Use the Hermes installation you have: a checkout awaiting setup, a CLI with no
+provider configured, or an installation running gateways and a dashboard. This
+package discovers installed components and lets you choose which deployment
+steps to perform. It does not require a completed Hermes setup or install Hermes
+for you.
+
+Each update fixes one upstream commit as its target, verifies a separate
+candidate, and promotes it only after the checks pass. Interrupted work resumes
+from saved state. Optional Codex repairs have an explicit attempt limit.
 
 ## Install
 
-For Linux with user systemd and Hermes Agent at `~/.hermes/hermes-agent`.
-Requires Python 3.11+, Bash, Git, uv, Node/npm, Bubblewrap, jq, curl, and an
-authenticated Codex CLI. The host must permit Bubblewrap namespaces.
-The current deployment checks require `hermes-gateway.service`,
-`hermes-dashboard.service`, gateway health on port 8644, and dashboard APIs on
-port 9119. This package does not install Hermes or those services.
+Supported: Linux, system Python 3.11+, Bash, Git, and a writable Hermes Git checkout.
+The default checkout is `~/.hermes/hermes-agent`; an installed Python environment
+is detected at `<checkout>/venv`. A user systemd manager provides scheduling and
+resource limits. Custom checkout and Hermes data paths are supported.
 
 ```sh
 gh repo clone justcarlson/awesome-hermes-updates ~/projects/awesome-hermes-updates
@@ -22,55 +25,134 @@ cd ~/projects/awesome-hermes-updates
 ./install
 ```
 
-Set `HERMES_UPDATE_DASHBOARD_HOST` in
-`~/.config/awesome-hermes-updates/config` if the dashboard does not listen on
-`127.0.0.1`. For schedules that must run without a login, enable user lingering:
-`loginctl enable-linger "$USER"`.
-
-The installer keeps settings and recovery state. It installs a complete package
-generation, switches one link, and enables the Sunday 03:15 America/New_York
-timer. It refuses to install during an update. Run `./install` again after
-`git pull --ff-only` to install package changes. Previous generations remain
-under `~/.local/share/awesome-hermes-updates/releases/`.
-
-## Use
+For a different installation:
 
 ```sh
-systemctl --user start hermes-weekly-update.service --no-block
-systemctl --user status hermes-weekly-update.service
+./install --repo /path/to/hermes-agent --hermes-home /path/to/hermes-data
+```
+
+The installer can run before Hermes is configured. Native candidate verification
+needs uv and Bubblewrap with working namespaces; targets with a frontend also
+need Node/npm. These are updater tools, not requirements to configure a gateway,
+provider, or dashboard. Codex is needed only if you opt into source repairs.
+Unsupported target verifier layouts stop with an explanation and saved evidence.
+
+New installations are **on demand**. Reinstallation preserves your settings,
+existing schedule, and recovery state. Package files are installed as an immutable
+generation with an atomic `current` link. Previous generations remain available.
+
+## Choose what to update
+
+```sh
+hermes-updates plan
+hermes-updates config
+hermes-updates configure --dashboard off --migrate off
+hermes-updates configure --profiles default,work --extras anthropic
+hermes-updates run --check
+hermes-updates run
+```
+
+`plan` shows configured options and resolved actions without fetching upstream
+or changing Hermes. `run --check` reports the selected upstream target without
+promoting it. `run` waits for the result and streams output within a systemd
+resource boundary.
+
+| Option | `auto` (default) | `off` |
+| --- | --- | --- |
+| `--python` | Sync an existing `venv`, preserving separately installed packages | Leave Python dependencies unchanged |
+| `--node` | Refresh existing Node dependencies, or prepare them for an installed dashboard | Leave Node dependencies unchanged |
+| `--dashboard` | Rebuild an installed dashboard when Node updates are selected; restart it if running | Leave dashboard build and service alone |
+| `--gateway` | Restart selected gateways that were running | Leave gateway services alone |
+| `--migrate` | Migrate existing configuration files for selected profiles | Leave configuration files alone |
+| `--runtime` | Check and repair the installed Python SQLite runtime if necessary | Leave the runtime alone |
+
+`on` explicitly requests an applicable operation; missing capabilities stop the
+run before promotion. Node and dashboard `on` can prepare those components when
+the checkout includes their manifests. Gateway `on` requires a running selected
+gateway; updates never start an inactive service. A blank profile is valid.
+
+`--profiles auto` selects existing profile homes. A comma-separated list scopes
+configuration migration, update-status cache invalidation, and gateway restarts;
+`default` means the main Hermes home. Dashboard and dependencies are shared.
+`--extras` chooses additional optional Python extras; the default is core
+requirements without expanding the installation to every integration.
+
+**Source always advances as a whole Git commit.** All profiles using that checkout
+see the same source. These options limit dependency, configuration, runtime, and
+service actions; they do not pin individual source folders or profile versions.
+If installed dependencies are disabled and the target changes their manifests,
+the updater stops before promotion. Runtime repair also requires permission to
+maintain every running service that uses the environment.
+
+A checkout with no Python environment or running services receives a verified
+source update without creating those components. Existing user skills, provider
+credentials, and unrelated services are not synchronized or installed.
+
+## Set a schedule
+
+```sh
+hermes-updates schedule 'daily'
+hermes-updates schedule 'Sun *-*-* 03:15:00 America/New_York'
+hermes-updates schedule on-demand
+```
+
+Calendars use systemd syntax and are validated before saving. Include a timezone
+when you need one; otherwise the host timezone applies. Missed scheduled runs
+are persistent. For runs without a login, enable user lingering with
+`loginctl enable-linger "$USER"`.
+
+Existing `hermes-weekly-update` service and timer names remain compatible:
+
+```sh
+systemctl --user status hermes-weekly-update.timer
 journalctl --user -u hermes-weekly-update.service -n 40
 ```
 
-For an agent, install both folders in [`skills/`](skills/) into its skill store,
-then ask it to use `update-hermes-agent`. The same service handles both paths.
-Existing unit names are retained for compatibility; the schedule is optional.
-Use `systemctl --user edit hermes-weekly-update.timer` to change it, or
-`systemctl --user disable --now hermes-weekly-update.timer` for on-demand use.
+On Linux without a user systemd manager, install with `./install --no-systemd`,
+configure with `hermes-updates configure --no-systemd ...`, and use
+`hermes-updates run --direct`. Direct execution retains locking and verification,
+but the caller supplies resource limits and any external scheduling.
 
-The default target is upstream `main`. Set `HERMES_UPDATE_REF` for a tag, or
-`HERMES_UPDATE_TARGET_SHA` for a full commit already fetched into the local
-repository. Saved transactions take precedence. See the
-[operator skill](skills/hermes-weekly-update/SKILL.md) for recovery and checks.
+## Settings and recovery
 
-## Limits
+Settings live in `~/.config/awesome-hermes-updates/config`. The CLI writes literal
+assignments; shell commands and variable substitutions are not evaluated.
+Environment variables override saved settings for an individual run. Paths are
+absolute or start with `~/`. `HERMES_HOME` supplies the initial Hermes data root;
+explicit `HERMES_UPDATE_HOME` and `HERMES_UPDATE_REPO` take precedence.
 
-The service permits four test workers, six CPU cores, 8 GiB of memory, no swap,
-and four hours per start. Source repair has four attempts with ten minutes each.
-Passing test-file results survive compatible retries. Deployment checks include
-active profiles, installed code, HTTP health, and the Python SQLite runtime.
-Logs and transaction state are in `~/.local/state/hermes-weekly-update/`.
+CLI options map to `HERMES_UPDATE_PYTHON`, `HERMES_UPDATE_NODE`,
+`HERMES_UPDATE_DASHBOARD`, `HERMES_UPDATE_GATEWAY`, `HERMES_UPDATE_MIGRATE`,
+`HERMES_UPDATE_RUNTIME`, `HERMES_UPDATE_PROFILES`, and `HERMES_UPDATE_EXTRAS`.
+Use `hermes-updates configure --ref TAG` to select a ref instead of upstream
+`main`. `HERMES_UPDATE_TARGET_SHA` selects a full commit already fetched locally.
+Saved transactions take precedence over a newly requested target.
 
-Always start updates through systemd. Do not run `hermes update`, run the full
-test suite in production, or delete pending state to clear a failure. Automatic
-recovery can stop safely; it cannot promise to repair every upstream fault.
+Source repair defaults to zero attempts. To opt in with an authenticated Codex
+CLI, use `hermes-updates configure --max-repairs 4`. Each attempt has ten minutes.
+Systemd runs allow four test workers, six CPU cores, 8 GiB memory, no swap, and
+four hours per run. Deployment retries and source repair budgets are bounded.
+
+Logs, receipts, candidates, and pending state live in
+`~/.local/state/hermes-weekly-update/`. Recovery preserves the selected actions
+and running-service inventory. Finish recovery with the same settings before
+changing scope; never delete pending markers or reset the installed checkout to
+clear a failure. Inspect the saved verification log for an unsupported target
+or failed gate. A bounded stop is a failure with evidence, not a successful update.
+
+Reinstall after `git pull --ff-only` to update this package. The
+[operator skill](skills/hermes-weekly-update/SKILL.md) describes recovery checks;
+install both directories in [`skills/`](skills/) into your agent's skill store
+if you want an agent to operate the updater. Research and the implementation /
+review task graph are in [docs/research.md](docs/research.md).
 
 ## Develop
 
 ```sh
-uv run --group dev pytest -q
+./check
 ./install --stage /tmp/ahu-install-check
 ```
 
-Tests use temporary repositories and fake deployment commands. They do not
-update the installed harness. The controller is in `bin/`, service definitions
-are in `systemd/`, and agent instructions are in `skills/`.
+Tests use temporary repositories and fake deployment tools, including partial
+installations, scope restrictions, schedules, and interrupted updates. The `check`
+command runs shell syntax checks and the regression suite on Python 3.11 and 3.13.

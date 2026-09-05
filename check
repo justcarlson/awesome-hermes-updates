@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Reproduce the supported interpreter matrix without changing installed Hermes.
+set -euo pipefail
+cd "$(dirname "$(realpath "$0")")"
+bash -n bin/hermes-weekly-update
+bash -n bin/hermes-update-deployment
+for version in 3.11 3.13; do
+  printf 'Verifying with Python %s\n' "$version"
+  UV_PROJECT_ENVIRONMENT=".venv-check-$version" uv run --python "$version" --locked --group dev pytest -q
+done

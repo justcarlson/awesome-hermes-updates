@@ -1,103 +1,54 @@
 ---
 name: update-hermes-agent
-description: Use when asked to update Hermes Agent. Launch and monitor its managed service with one fixed upstream target, bounded repair, and automatic recovery until success or a safe terminal stop.
-version: 2.4.0
+description: Update an existing Hermes Agent installation with its configured scope, verified candidate, and saved recovery state. Supports partially configured and CLI-only installations.
+version: 3.0.0
 author: Hermes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [git, update, recovery, hermes-agent, codex, pi]
-    related_skills: [hermes-weekly-update, hermes-agent]
+    tags: [update, recovery, hermes-agent]
+    related_skills: [hermes-weekly-update]
 ---
 
 # Update Hermes Agent
 
-Use this skill as the only requested command for a managed Hermes Agent update.
-Read `~/.local/share/awesome-hermes-updates/current/README.md` and load `hermes-weekly-update`.
-That skill supplies the host route, checks, limits, and recovery procedure.
-This skill does not update arbitrary Git repositories.
+Read the installed package README and `hermes-weekly-update` operator skill.
+Use this package's configured installation and scope. Do not assume a provider,
+gateway, dashboard, named profile, Codex authentication, or schedule exists.
+Do not invent a remote host or a host-specific connection command.
 
-## Execute the Request
+## Run
 
-1. Inspect the service and `~/.local/state/hermes-weekly-update/` before launch.
-   Use the local
-   user-systemd manager on Hermes Agent. From another host, start with
-   `sc-remote source` and `sc-remote list`, check `hermes-agent`, and use
-   `sc-remote run hermes-agent -- <command>`.
-2. Monitor an active run or scheduled automatic restart. When the unit is
-   inactive or failed, start it once:
+1. Use `hermes-updates config` and `hermes-updates plan` to inspect the installation,
+   selected actions, and optional schedule. Check the configured state directory
+   and any running updater before starting another run.
+2. Use `hermes-updates run` to start and wait for a bounded update. For an existing
+   scheduled service run, monitor `hermes-weekly-update.service` and its journal.
+   The lock prevents concurrent updates. On installations explicitly configured
+   without systemd, use `hermes-updates run --direct` with caller-managed limits.
+3. Resume pending work with the same settings and target. The scheduled service
+   owns automatic retries; do not race its restart delay or reset failed counters.
+   A manual run may be repeated within the saved retry budget.
+4. Report success only after the run exits successfully, pending markers are
+   absent, and the installed source contains the recorded target. Check only
+   the selected components and services captured by the transaction. A disabled
+   timer or absent gateway is valid.
 
-   ```bash
-   systemctl --user start hermes-weekly-update.service --no-block
-   ```
+## Scope and repairs
 
-3. Continue to inspect the same unit and its journal:
+Source advances as one shared Git commit. Profile selection scopes migration,
+cache invalidation, and gateway restarts, not independent profile source versions.
+Deployment options do not weaken candidate verification. Dependencies, dashboard
+builds, migration, gateway maintenance, and runtime repair are individually
+configurable. Never expand scope to clear a failed check without authorization.
 
-   ```bash
-   systemctl --user show hermes-weekly-update.service \
-     -p ActiveState -p SubState -p Result -p ExecMainStatus -p NRestarts
-   journalctl --user -u hermes-weekly-update.service -n 30 --no-pager
-   ```
+Codex repair is opt-in; zero attempts is the default. Dependency/tooling failures
+must not trigger speculative source edits. Failed candidates, logs, and repair
+counters remain available for diagnosis. A safe terminal stop is an update failure.
 
-   systemd owns retries, including the two-minute delay. Do not start another
-   run when a shell call ends. Do not automate `reset-failed` or bypass the
-   four-attempt service limit for each candidate and installed updater revision.
-   Total starts and source-repair counts remain recorded across revisions. Keep the user task open through retries.
-4. Report a failed transaction on exit 78. A future launch can archive it and
-   select a different upstream commit; the same rejected SHA gets no new source-repair budget.
-   The service also replaces candidates older than six hours. Explicit target
-   overrides stay pinned. Do not erase evidence or change counters yourself.
-5. On success, verify the full target SHA and its ancestry in production;
-   installed version; final tests; absent pending markers; gateway, dashboard,
-   and recorded active profile health; HTTP health; and the enabled timer.
-   Read saved logs and candidate summaries. A successful launch is not proof
-   of a successful update.
+Never run the full test matrix in the installed checkout, manually remove pending
+state, reset production Git, or bypass saved budgets. Use the package's update
+path rather than launching a competing `hermes update` transaction.
 
-## Fixed Target
-
-The default source is `main`. An explicit release tag can be configured through
-`HERMES_UPDATE_REF`. The service resolves the source once and saves the full
-commit SHA. `repair-pending` and `promotion-pending` take precedence over new
-selection. Resume their target without fetching or checking newer upstream work.
-The recovery unit resumes pending work after user-manager startup. The persistent
-weekly timer catches missed scheduled runs.
-
-An explicit `HERMES_UPDATE_TARGET_SHA` must name a full commit already present
-in the local repository. Use a reviewed service override before launch, retain
-it until saved state or a terminal no-op proves selection, then remove it and
-reload units. Do not set and immediately unset the manager environment around
-`start --no-block`; startup can read the environment after it was cleared.
-
-## Bounded Repair and Deployment
-
-Dependency setup failure 69 receives service retries without a Codex repair.
-Source repair has a 10-minute timeout and four total attempts per candidate by
-default. Its counter survives restarts. `HERMES_UPDATE_MAX_REPAIRS` supports 0
-through 20, but a blocked candidate must not bypass its recorded limit.
-A repair that makes no progress saves a terminal block.
-
-The service uses private test HOME, a fresh `/tmp` for each check stage, one
-test-file retry, and cached dependencies.
-Per-file results survive test-only repairs; runtime and shared-fixture changes
-invalidate them. Failed files run first. Generated data files are archived. It checks that verification did not change
-HEAD or leave uncommitted files. Web assets must build before promotion.
-The service records active profiles, migrates configuration, refreshes service
-definitions, restarts services, and checks their processes and installed SHA.
-Pending promotion recovery finishes deployment on the recorded commit.
-The runtime check also runs when Git is current. Upstream stages a safe SQLite
-runtime; the wrapper preserves installed extras and checks dependencies before
-restarting services. Deployment has four attempts per controller revision.
-
-Unattended operation means bounded automatic recovery or a safe stop with useful
-evidence. It cannot guarantee repair of every upstream defect or external outage.
-
-## Safety and Report
-
-Never run `hermes update`, invoke the updater script outside its managed service,
-or run the full matrix in production. Never manually delete pending markers or repair
-state, rewrite production Git, or bypass resource limits. Do not launch a
-second detached Codex goal to operate the same update.
-
-Report the terminal result, full target and production SHAs, tests, repair count,
-pending markers, service and HTTP health, peak resources, next timer run, and
-remaining risks. Distinguish an update success from a safe terminal stop.
+Report the result, target and installed SHAs, relevant verification evidence,
+repair count, pending state, selected service health, and schedule if enabled.

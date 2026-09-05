@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Install one immutable package generation, then switch it into use."""
 import argparse
-import fcntl
 import hashlib
 import os
 from pathlib import Path
 import shutil
+import runpy
+import sys
 import subprocess
 import tempfile
 
@@ -13,25 +14,53 @@ import tempfile
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stage', type=Path, help='build a test installation in this directory; do not use systemd')
+    parser.add_argument('--no-systemd', action='store_true', help='install manual commands without using systemd')
+    parser.add_argument('--repo', help='Hermes Agent Git checkout (default: HERMES_HOME/hermes-agent)')
+    parser.add_argument('--hermes-home', help='Hermes data directory (default: HERMES_HOME or ~/.hermes)')
+    parser.add_argument('--schedule', help='on-demand, or a systemd calendar such as daily; existing schedules are preserved')
     args = parser.parse_args()
     source = Path(__file__).resolve().parent
     home = args.stage.resolve() if args.stage else Path.home()
+    helper = runpy.run_path(str(source / 'bin/hermes-update-config'))
+    config = helper['config_path'](home)
+    saved = helper['read_config'](config)
+    proposed = dict(saved)
+    use_systemd = not args.stage and not args.no_systemd
+    installed_timer = home / '.config/systemd/user/hermes-weekly-update.timer'
+    timer_dropin = home / '.config/systemd/user/hermes-weekly-update.timer.d/schedule.conf'
+    # Import the legacy calendar before switching immutable releases. The timer's
+    # enabled state is preserved by leaving systemctl enable/disable untouched.
+    if installed_timer.exists() and not timer_dropin.exists() and 'HERMES_UPDATE_SCHEDULE' not in saved and not args.schedule:
+        calendars = helper['timer_calendars'](home, use_systemd=use_systemd)
+        if len(calendars) == 1:
+            proposed['HERMES_UPDATE_SCHEDULE'] = calendars[0]
+        elif len(calendars) > 1:
+            parser.error('the existing timer has multiple calendar expressions; pass --schedule to choose its replacement')
+    if args.repo:
+        proposed['HERMES_UPDATE_REPO'] = args.repo
+    if args.hermes_home:
+        proposed['HERMES_UPDATE_HOME'] = args.hermes_home
+    if args.schedule:
+        helper['validate_calendar'](args.schedule)
+        proposed['HERMES_UPDATE_SCHEDULE'] = args.schedule
+    # Capture HERMES_HOME only for a real first installation, never from stage tests.
+    if not config.exists() and not args.stage and os.environ.get('HERMES_HOME') and not args.hermes_home:
+        proposed['HERMES_UPDATE_HOME'] = os.environ['HERMES_HOME']
+    settings = helper['effective'](proposed, home=home, environ={})
+    helper['validate_calendar'](settings['HERMES_UPDATE_SCHEDULE'])
+    previous = helper['effective'](saved, home=home, environ={})
+    use_systemd = not args.stage and not args.no_systemd
+    fresh_timer = not (home / '.config/systemd/user/hermes-weekly-update.timer').exists()
     if not args.stage:
-        for command in ('bash', 'git', 'uv', 'node', 'npm', 'codex', 'bwrap', 'jq', 'curl', 'flock', 'systemctl'):
+        for command in ('bash', 'git', 'python3'):
             if not shutil.which(command):
                 parser.error(f'missing required command: {command}')
-        if not (home / '.hermes/hermes-agent/.git').is_dir():
-            parser.error('install Hermes Agent in ~/.hermes/hermes-agent first')
-        subprocess.run(['systemctl', '--user', 'show-environment'], check=True, stdout=subprocess.DEVNULL)
-    state = home / '.local/state/hermes-weekly-update'
-    state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (state / 'update.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            parser.error('an update is running; install after it stops')
+    if use_systemd:
+        helper['check_user_manager']()
+    with helper['settings_lock'](previous, reject_pending=bool(args.repo or args.hermes_home)):
+        helper['prepare_runtime_dirs'](home, settings)
         files = [source / 'README.md']
-        for directory in ('bin', 'systemd', 'skills'):
+        for directory in ('bin', 'systemd', 'skills', 'docs'):
             files.extend(sorted(p for p in (source / directory).rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc'))
         digest = hashlib.sha256()
         for file in files:
@@ -64,20 +93,31 @@ def main():
         link(release, base / 'current')
         for file in (release / 'bin').iterdir():
             link(base / 'current/bin' / file.name, home / '.local/bin' / file.name)
-        for file in (release / 'systemd').iterdir():
-            link(base / 'current/systemd' / file.name, home / '.config/systemd/user' / file.name)
-        config = home / '.config/awesome-hermes-updates/config'
-        config.parent.mkdir(parents=True, exist_ok=True)
-        if not config.exists():
-            config.write_text('# systemd environment file. Set the dashboard listen address if needed.\n# HERMES_UPDATE_DASHBOARD_HOST=127.0.0.1\n')
-            config.chmod(0o600)
+        if not args.no_systemd:
+            for file in (release / 'systemd').iterdir():
+                link(base / 'current/systemd' / file.name, home / '.config/systemd/user' / file.name)
+        if not config.exists() or proposed != saved:
+            helper['write_config'](config, proposed)
+        if not args.no_systemd:
+            # Preserve the pre-configuration weekly timer on upgrade unless the
+            # user explicitly changes it. Its old calendar remains in a drop-in.
+            timer_dropin = home / '.config/systemd/user/hermes-weekly-update.timer.d/schedule.conf'
+            old_calendar = timer_dropin.read_text() if timer_dropin.exists() else None
+            helper['write_units'](home, settings)
+            if not fresh_timer and not args.schedule and old_calendar is not None:
+                helper['atomic_write'](timer_dropin, old_calendar)
         (base / 'source').write_text(str(source) + '\n')
-    if not args.stage:
-        subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
-        subprocess.run(['systemctl', '--user', 'enable', '--now', 'hermes-weekly-update.timer'], check=True)
-        subprocess.run(['systemctl', '--user', 'enable', 'hermes-weekly-update-recovery.service'], check=True)
+    if use_systemd:
+        helper['systemctl']('daemon-reload')
+        if args.schedule or fresh_timer:
+            helper['apply_schedule'](settings)
+        helper['systemctl']('enable', 'hermes-weekly-update-recovery.service')
     print(f'Installed Awesome Hermes Updates: {release.name}')
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f'Error: {error}', file=sys.stderr)
+        sys.exit(78)
