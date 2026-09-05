@@ -1,0 +1,1109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo="${HERMES_UPDATE_REPO:-$HOME/.hermes/hermes-agent}"
+state_dir="${HERMES_UPDATE_STATE_DIR:-$HOME/.local/state/hermes-weekly-update}"
+verifier_npm_version="${HERMES_UPDATE_NPM_VERSION:-12.0.2}"
+verifier_npm_prefix="$state_dir/toolchain/npm-$verifier_npm_version"
+verifier_npm_bin="$verifier_npm_prefix/node_modules/.bin/npm"
+repair_pending_file="$state_dir/repair-pending"
+pending_file="$state_dir/promotion-pending"
+candidate=""
+keep_candidate=0
+target_sha=""
+production_sha=""
+mode="promote"
+max_repairs="${HERMES_UPDATE_MAX_REPAIRS:-4}"
+profiles_file="$state_dir/deployment-profiles"
+state_helper="$(dirname "${BASH_SOURCE[0]}")/hermes-update-state"
+if [[ ! -f "$state_helper" ]]; then
+  state_helper="$(dirname "${BASH_SOURCE[0]}")/executable_hermes-update-state"
+fi
+state_helper="$(realpath "$state_helper")"
+updater_digest="$(cat "${BASH_SOURCE[0]}" "$state_helper" | sha256sum | cut -d ' ' -f 1)"
+
+if [[ "${1:-}" == "--check" ]]; then
+  mode="check"
+  shift
+fi
+if (($#)); then
+  printf 'usage: hermes-weekly-update [--check]\n' >&2
+  exit 64
+fi
+
+install -d -m 0700 "$state_dir"
+if [[ ! "$max_repairs" =~ ^(0|[1-9][0-9]?)$ ]] || ((max_repairs > 20)); then
+  printf 'BLOCKED HERMES_UPDATE_MAX_REPAIRS must be between 0 and 20\n' >&2
+  exit 78
+fi
+exec 9>"$state_dir/update.lock"
+if ! flock -n 9; then
+  printf 'BLOCKED another updater run owns %s\n' "$state_dir/update.lock" >&2
+  exit 75
+fi
+
+write_receipt() {
+  local result=$?
+  if [[ "$mode" != check ]]; then
+    {
+      printf 'finished=%s\nexit_status=%s\n' "$(date -u +%FT%TZ)" "$result"
+      printf 'production=%s\ntarget=%s\ncandidate=%s\n' "$production_sha" "$target_sha" "$candidate"
+      printf 'repair_pending=%s\npromotion_pending=%s\n' \
+        "$(test -f "$repair_pending_file" && printf yes || printf no)" \
+        "$(test -f "$pending_file" && printf yes || printf no)"
+    } >"$state_dir/last-result.tmp.$$"
+    mv -f -- "$state_dir/last-result.tmp.$$" "$state_dir/last-result"
+  fi
+  if declare -F cleanup >/dev/null; then cleanup; fi
+  return "$result"
+}
+trap write_receipt EXIT
+
+if [[ ! -d "$repo/.git" ]]; then
+  printf 'BLOCKED Hermes repository not found at %s\n' "$repo" >&2
+  exit 66
+fi
+
+invalidate_update_caches() {
+  local cache
+
+  rm -f -- "$HOME/.hermes/.update_check"
+  for cache in "$HOME"/.hermes/profiles/*/.update_check; do
+    [[ -e "$cache" ]] || continue
+    rm -f -- "$cache"
+  done
+}
+
+ensure_verifier_npm() {
+  local actual_version=""
+  local bootstrap_npm
+
+  if [[ -x "$verifier_npm_bin" ]]; then
+    actual_version="$($verifier_npm_bin --version 2>/dev/null || true)"
+  fi
+  if [[ "$actual_version" == "$verifier_npm_version" ]]; then
+    return
+  fi
+
+  bootstrap_npm="$(command -v npm || true)"
+  if [[ -z "$bootstrap_npm" ]]; then
+    printf 'npm is required to install verifier npm %s\n' "$verifier_npm_version" >&2
+    return 1
+  fi
+  install -d -m 0700 "$verifier_npm_prefix"
+  (
+    cd "$state_dir"
+    "$bootstrap_npm" install --prefix "$verifier_npm_prefix" \
+      --no-audit --no-fund --ignore-scripts --no-package-lock \
+      "npm@$verifier_npm_version"
+  )
+  actual_version="$($verifier_npm_bin --version 2>/dev/null || true)"
+  if [[ "$actual_version" != "$verifier_npm_version" ]]; then
+    printf 'verifier npm version mismatch: expected %s, found %s\n' \
+      "$verifier_npm_version" "${actual_version:-missing}" >&2
+    return 1
+  fi
+}
+
+run_verifier_npm() {
+  ensure_verifier_npm || return 69
+  PATH="$(dirname "$verifier_npm_bin"):$PATH" "$verifier_npm_bin" "$@"
+}
+
+fetch_upstream() {
+  local attempt
+
+  for attempt in 1 2 3; do
+    if timeout --signal=TERM --kill-after=30s 5m git -C "$repo" fetch --quiet origin "${HERMES_UPDATE_REF:-main}"; then
+      return
+    fi
+    printf 'upstream fetch attempt %s of 3 failed\n' "$attempt" >&2
+    if ((attempt < 3)); then
+      sleep 15
+    fi
+  done
+  printf 'BLOCKED upstream fetch failed after 3 bounded attempts\n' >&2
+  return 69
+}
+
+is_full_sha() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+require_commit() {
+  local worktree="$1"
+  local sha="$2"
+  local label="$3"
+
+  if ! is_full_sha "$sha" \
+    || ! git -C "$worktree" cat-file -e "$sha^{commit}" 2>/dev/null; then
+    printf 'BLOCKED invalid or missing %s commit: %s\n' "$label" "$sha" >&2
+    return 1
+  fi
+}
+
+read_worktree_status() {
+  local worktree="$1"
+  local label="$2"
+
+  worktree_status=""
+  if ! worktree_status="$(git -C "$worktree" status --porcelain)"; then
+    printf 'BLOCKED cannot read %s worktree status: %s\n' \
+      "$label" "$worktree" >&2
+    return 1
+  fi
+}
+
+candidate_path_is_safe() {
+  local path="$1"
+  local name
+
+  [[ "$path" == "$state_dir"/* ]] || return 1
+  name="${path#"$state_dir"/}"
+  [[ "$name" =~ ^candidate\.[A-Za-z0-9]+$ ]]
+}
+
+write_repair_pending() {
+  local phase="$1"
+  local path="$2"
+  local checkpoint="$3"
+  local failure_log="$4"
+  local tmp="$repair_pending_file.tmp.$$"
+
+  {
+    printf 'version=1\n'
+    printf 'production=%s\n' "$production_sha"
+    printf 'target=%s\n' "$target_sha"
+    printf 'phase=%s\n' "$phase"
+    printf 'candidate=%s\n' "$path"
+    printf 'checkpoint=%s\n' "$checkpoint"
+    printf 'failure_log=%s\n' "$failure_log"
+  } >"$tmp"
+  mv -f -- "$tmp" "$repair_pending_file"
+}
+
+load_repair_pending() {
+  local -a fields
+
+  mapfile -t fields <"$repair_pending_file"
+  if ((${#fields[@]} != 7)) \
+    || [[ "${fields[0]}" != "version=1" ]] \
+    || [[ "${fields[1]}" != production=* ]] \
+    || [[ "${fields[2]}" != target=* ]] \
+    || [[ "${fields[3]}" != phase=* ]] \
+    || [[ "${fields[4]}" != candidate=* ]] \
+    || [[ "${fields[5]}" != checkpoint=* ]] \
+    || [[ "${fields[6]}" != failure_log=* ]]; then
+    printf 'BLOCKED malformed repair marker: %s\n' "$repair_pending_file" >&2
+    return 1
+  fi
+
+  repair_production="${fields[1]#production=}"
+  repair_target="${fields[2]#target=}"
+  repair_phase="${fields[3]#phase=}"
+  repair_candidate="${fields[4]#candidate=}"
+  repair_checkpoint="${fields[5]#checkpoint=}"
+  repair_failure_log="${fields[6]#failure_log=}"
+
+  is_full_sha "$repair_production" || {
+    printf 'BLOCKED invalid repair production SHA\n' >&2
+    return 1
+  }
+  is_full_sha "$repair_target" || {
+    printf 'BLOCKED invalid repair target SHA\n' >&2
+    return 1
+  }
+  case "$repair_phase" in
+    selected | merge | verify | repair) ;;
+    *)
+      printf 'BLOCKED invalid repair phase: %s\n' "$repair_phase" >&2
+      return 1
+      ;;
+  esac
+  if [[ "$repair_phase" == "selected" ]]; then
+    if [[ "$repair_candidate" != "-" || "$repair_checkpoint" != "-" \
+      || "$repair_failure_log" != "-" ]]; then
+      printf 'BLOCKED invalid selected repair state\n' >&2
+      return 1
+    fi
+    return
+  fi
+
+  if ! candidate_path_is_safe "$repair_candidate" \
+    || [[ -L "$repair_candidate" ]] \
+    || [[ ! -d "$repair_candidate/.git" ]]; then
+    printf 'BLOCKED invalid repair candidate path: %s\n' \
+      "$repair_candidate" >&2
+    return 1
+  fi
+  require_commit "$repair_candidate" "$repair_checkpoint" \
+    "repair checkpoint" || return 1
+  if [[ "$repair_failure_log" != "-" ]]; then
+    if [[ "$repair_failure_log" != "$state_dir"/*.verify-*.log \
+      || ! -f "$repair_failure_log" ]]; then
+      printf 'BLOCKED invalid repair failure log: %s\n' \
+        "$repair_failure_log" >&2
+      return 1
+    fi
+  fi
+}
+
+finish_repair_state() {
+  local promoted_previous="$1"
+  local promoted_target="$2"
+  local promoted_candidate="$3"
+  local invalid_marker
+  local repair_head
+
+  [[ -f "$repair_pending_file" ]] || return 0
+  if load_repair_pending \
+    && [[ "$repair_production" == "$promoted_previous" ]] \
+    && [[ "$repair_target" == "$promoted_target" ]] \
+    && [[ "$repair_checkpoint" == "$promoted_candidate" ]] \
+    && [[ "$repair_candidate" != "-" ]]; then
+    if ! repair_head="$(git -C "$repair_candidate" rev-parse HEAD)" \
+      || ! read_worktree_status "$repair_candidate" "repair candidate"; then
+      return 1
+    fi
+    if [[ "$repair_head" == "$repair_checkpoint" \
+      && -z "$worktree_status" ]] \
+      && candidate_path_is_safe "$repair_candidate" \
+      && [[ ! -L "$repair_candidate" ]]; then
+      rm -rf -- "$repair_candidate"
+      rm -f -- "$repair_pending_file"
+      return
+    fi
+  fi
+
+  invalid_marker="$state_dir/repair-pending.invalid.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  mv -- "$repair_pending_file" "$invalid_marker"
+  printf 'WARNING archived invalid repair marker after successful promotion: %s\n' \
+    "$invalid_marker" >&2
+}
+
+validate_promotion_pending() {
+  pending_previous=""
+  pending_target=""
+  pending_candidate=""
+  local extra=""
+  local -a lines
+
+  mapfile -t lines <"$pending_file"
+  if ((${#lines[@]} != 1)) \
+    || ! read -r pending_previous pending_target pending_candidate extra \
+      <<<"${lines[0]:-}" \
+    || [[ -z "$pending_previous" || -z "$pending_target" \
+      || -z "$pending_candidate" || -n "$extra" ]]; then
+    printf 'BLOCKED malformed promotion marker: %s\n' "$pending_file" >&2
+    return 1
+  fi
+  if ! require_commit "$repo" "$pending_previous" "promotion previous" \
+    || ! require_commit "$repo" "$pending_target" "promotion target" \
+    || ! require_commit "$repo" "$pending_candidate" "promotion candidate"; then
+    printf 'BLOCKED malformed promotion marker: %s\n' "$pending_file" >&2
+    return 1
+  fi
+  if ! git -C "$repo" merge-base --is-ancestor \
+    "$pending_previous" "$pending_candidate" \
+    || ! git -C "$repo" merge-base --is-ancestor \
+      "$pending_target" "$pending_candidate"; then
+    printf 'BLOCKED promotion marker has invalid ancestry\n' >&2
+    return 1
+  fi
+}
+
+load_deployment_profiles() {
+  local previous="$1"
+  local inventory unit
+  local -a saved
+  if [[ ! -f "$profiles_file" ]]; then
+    inventory="$(systemctl --user list-units 'hermes-gateway*.service' \
+      --state=active,activating,reloading --plain --no-legend --no-pager)" || return 1
+    {
+      printf '%s\n' "$previous" 'hermes-gateway.service'
+      awk '$1 ~ /^hermes-gateway-.+\.service$/ {print $1}' <<<"$inventory"
+    } >"$profiles_file.tmp.$$"
+    mv -f -- "$profiles_file.tmp.$$" "$profiles_file"
+  fi
+  mapfile -t saved <"$profiles_file"
+  if [[ "${saved[0]:-}" != "$previous" || "${saved[1]:-}" != hermes-gateway.service ]]; then
+    printf 'BLOCKED deployment profile inventory does not match production\n' >&2
+    return 78
+  fi
+  deployment_profiles=("${saved[@]:1}")
+  for unit in "${deployment_profiles[@]}"; do
+    if [[ ! "$unit" =~ ^hermes-gateway(-[A-Za-z0-9_-]+)?\.service$ ]]; then
+      printf 'BLOCKED invalid deployment profile unit: %s\n' "$unit" >&2
+      return 78
+    fi
+    profile_home_for_unit "$unit"
+    if [[ ! -d "$profile_home" ]]; then
+      printf 'BLOCKED profile home is missing: %s\n' "$profile_home" >&2
+      return 78
+    fi
+  done
+}
+
+profile_home_for_unit() {
+  local unit="$1"
+  profile_home="$HOME/.hermes"
+  if [[ "$unit" != hermes-gateway.service ]]; then
+    local profile="${unit#hermes-gateway-}"
+    profile_home="$HOME/.hermes/profiles/${profile%.service}"
+  fi
+}
+
+recover_test_artifacts() {
+  local blocked="$candidate/.git/hermes-repair-blocked"
+  [[ "$repair_phase" == verify ]] || return 0
+  # This is a narrow state migration, not permission to ignore changed source.
+  if [[ -f "$blocked" ]]; then
+    [[ "$(cat "$blocked")" == "BLOCKED verification changed candidate source or HEAD; target=$target_sha candidate=$candidate" ]] || return 0
+    [[ "$(git -C "$candidate" rev-parse HEAD)" == "$repair_checkpoint" ]] || return 0
+    git -C "$candidate" diff --quiet HEAD -- || return 0
+
+  fi
+  /usr/bin/python3 "$state_helper" artifacts "$candidate" \
+    --state "$state_dir" --expected "$repair_checkpoint" || return 78
+  if [[ -f "$blocked" ]]; then
+    mv -- "$blocked" "$candidate/.git/hermes-artifact-block.recovered.$(date +%s)"
+    printf 'RECOVERED_TEST_ARTIFACTS target=%s candidate=%s\n' "$target_sha" "$candidate"
+  fi
+}
+
+recover_sandbox_block() {
+  local blocked="$candidate/.git/hermes-repair-blocked"
+  [[ "$repair_phase" == repair && -f "$blocked" ]] || return 0
+  [[ "$(cat "$blocked")" == "BLOCKED repair made no committed progress; target=$target_sha candidate=$candidate" ]] || return 0
+  [[ "$(git -C "$candidate" rev-parse HEAD)" == "$repair_checkpoint" ]] || return 0
+  read_worktree_status "$candidate" "sandbox recovery" || return 78
+  [[ -z "$worktree_status" ]] || return 0
+  # Recover only a proven sandbox-start failure, never an unsupported source fix.
+  /usr/bin/python3 - "$state_dir" "$repair_failure_log" <<'PYRECOVER' || return 0
+import json, pathlib, sys
+state, failure = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+prefix = failure.name.split('.verify-')[0]
+logs = list(state.glob(prefix + '.test-repair-*.jsonl'))
+if not logs:
+    raise SystemExit(1)
+entries = [json.loads(line) for line in max(logs, key=lambda p:p.stat().st_mtime).read_text().splitlines()]
+commands = [e['item'] for e in entries if e.get('type') == 'item.completed' and e.get('item', {}).get('type') == 'command_execution']
+error = 'bwrap: loopback: Failed to create NETLINK_ROUTE socket: Address family not supported by protocol'
+raise SystemExit(0 if commands and all(c.get('exit_code') == 1 and c.get('aggregated_output', '').strip() == error for c in commands) else 1)
+PYRECOVER
+  bwrap --unshare-net --ro-bind / / /bin/true || return 69
+  mv -- "$blocked" "$candidate/.git/hermes-sandbox-block.recovered.$(date +%s)"
+  printf 'RECOVERED_SANDBOX_START target=%s candidate=%s\n' "$target_sha" "$candidate"
+}
+
+recover_verifier_device_block() {
+  local blocked="$candidate/.git/hermes-repair-blocked"
+  [[ "$repair_phase" == repair && -f "$blocked" ]] || return 0
+  [[ "$(cat "$blocked")" == "BLOCKED repair made no committed progress; target=$target_sha candidate=$candidate" ]] || return 0
+  [[ "$(git -C "$candidate" rev-parse HEAD)" == "$repair_checkpoint" ]] || return 0
+  read_worktree_status "$candidate" "device recovery" || return 78
+  [[ -z "$worktree_status" ]] || return 0
+  [[ "$repair_failure_log" != - ]] || return 0
+  grep -Fxq "fatal: could not open '/dev/null' for reading and writing: Permission denied" "$repair_failure_log" || return 0
+  if grep -q '^PYTHON_PLAN' "$repair_failure_log"; then return 0; fi
+  /usr/bin/python3 "$state_helper" isolate /usr/bin/python3 -c \
+    'import subprocess,sys; subprocess.run(["git","-C",sys.argv[1],"rev-parse","HEAD"],stdout=subprocess.DEVNULL,check=True)' \
+    "$candidate" || return 69
+  mv -- "$blocked" "$candidate/.git/hermes-device-block.recovered.$(date +%s)"
+  # No tests ran, so return to verification; keep every recorded attempt.
+  write_repair_pending verify "$candidate" "$repair_checkpoint" -
+  repair_phase=verify
+  repair_failure_log=-
+  printf 'RECOVERED_VERIFIER_DEVICE target=%s candidate=%s\n' "$target_sha" "$candidate"
+}
+
+recover_empty_collection_block() {
+  local blocked="$candidate/.git/hermes-repair-blocked"
+  [[ "$repair_phase" == repair && -f "$blocked" ]] || return 0
+  [[ "$(cat "$blocked")" == "BLOCKED total repair budget exhausted or invalid:"* ]] || return 0
+  [[ "$(git -C "$candidate" rev-parse HEAD)" == "$repair_checkpoint" ]] || return 0
+  read_worktree_status "$candidate" "collection recovery" || return 78
+  [[ -z "$worktree_status" && "$repair_failure_log" != - ]] || return 0
+  "$candidate/venv/bin/python" "$state_helper" empty-recheck "$candidate" \
+    --log "$repair_failure_log" || return 0
+  mv -- "$blocked" "$candidate/.git/hermes-empty-collection-block.recovered.$(date +%s)"
+  touch "$candidate/.git/hermes-collection-control-required"
+  write_repair_pending verify "$candidate" "$repair_checkpoint" -
+  repair_phase=verify
+  repair_failure_log=-
+}
+
+recover_controller_budget() {
+  local blocked="$candidate/.git/hermes-repair-blocked"
+  local revision="$candidate/.git/hermes-controller-revision"
+  [[ -f "$blocked" && -f "$revision" ]] || return 0
+  [[ "$(cat "$blocked")" == "BLOCKED controller service retry budget exhausted; target=$target_sha candidate=$candidate" ]] || return 0
+  [[ "$(cat "$revision")" != "$updater_digest" ]] || return 0
+  mv -- "$blocked" "$candidate/.git/hermes-controller-block.recovered.$(date +%s)"
+  printf 'RECOVERED_CONTROLLER_REVISION target=%s revision=%s\n' "$target_sha" "$updater_digest"
+}
+
+retire_failed_target() {
+  local blocked="$candidate/.git/hermes-repair-blocked"
+  local started="$candidate/.git/hermes-transaction-started"
+  local now age next_target rejected started_at
+  now="$(date +%s)"
+  [[ -f "$started" ]] || printf '%s\n' "$now" >"$started"
+  read -r started_at <"$started"
+  [[ "$started_at" =~ ^[0-9]{1,12}$ ]] || return 78
+  age="$((now - 10#$started_at))"
+  if [[ ! -f "$blocked" ]] && ((age < 21600)); then return 0; fi
+  # An explicit target stays pinned even after failure. Scheduled/default runs
+  # may start a NEW transaction; they never mutate an existing target.
+  if [[ -n "${HERMES_UPDATE_TARGET_SHA:-}" ]]; then return 0; fi
+  fetch_upstream || return "$?"
+  next_target="$(git -C "$repo" rev-parse 'FETCH_HEAD^{commit}')"
+  if [[ "$next_target" == "$target_sha" ]]; then
+    printf 'REJECTED_TARGET_UNCHANGED target=%s; evidence retained\n' "$target_sha" >&2
+    exit 78
+  fi
+  require_commit "$repo" "$next_target" 'next transaction target' || return 78
+  rejected="$state_dir/rejected/$(date -u +%Y%m%dT%H%M%SZ).$$.$target_sha"
+  install -d -m 0700 "$rejected"
+  git -C "$repo" update-ref "refs/hermes-weekly-update/rejected/$target_sha" "$target_sha"
+  [[ ! -f "$state_dir/last-result" ]] || cp "$state_dir/last-result" "$rejected/last-result"
+  printf 'previous_target=%s\nnext_target=%s\ncandidate=%s\n' \
+    "$target_sha" "$next_target" "$candidate" >"$rejected/transition"
+  cp "$repair_pending_file" "$rejected/repair-pending"
+  printf 'REJECTED_TARGET_ARCHIVED target=%s next=%s evidence=%s\n' "$target_sha" "$next_target" "$rejected"
+  target_sha="$next_target"
+  write_repair_pending selected - - -
+  # Re-enter the same bounded service with this newly selected SHA. This also
+  # covers a crash after archival: no old state is removed or overwritten.
+  export HERMES_UPDATE_TARGET_SHA="$next_target"
+  exec "$0"
+}
+
+verify_profile_code() {
+  local expected="$1"
+  local unit pid
+  for unit in "${deployment_profiles[@]}"; do
+    systemctl --user is-active --quiet "$unit" || return 1
+    pid="$(systemctl --user show "$unit" -p MainPID --value)" || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    profile_home_for_unit "$unit"
+    jq -e --arg sha "$expected" --argjson pid "$pid" \
+      '.code_sha == $sha and .pid == $pid and .gateway_state == "running"' \
+      "$profile_home/gateway_state.json" >/dev/null 2>&1 || return 1
+  done
+}
+
+bounded_deploy() {
+  local previous="$1" promoted="$2" count=0
+  local counter="$state_dir/deployment-attempts.$promoted.$updater_digest"
+  [[ ! -f "$counter" ]] || read -r count <"$counter"
+  if [[ ! "$count" =~ ^[0-9]$ ]] || ((count >= 4)); then
+    printf 'BLOCKED deployment retry budget exhausted; evidence=%s\n' "$counter" >&2
+    return 78
+  fi
+  printf '%s\n' "$((count + 1))" >"$counter.tmp"
+  mv "$counter.tmp" "$counter"
+  deploy_production "$previous" "$promoted"
+}
+
+repair_production_runtime() {
+  if [[ ! -d "$state_dir/runtime-repair" ]] \
+    && /usr/bin/python3 "$state_helper" runtime-check "$repo"; then return 0; fi
+  printf 'RUNTIME_MAINTENANCE_REQUIRED source=%s\n' "$(git -C "$repo" rev-parse HEAD)"
+  systemctl --user stop "${deployment_profiles[@]}" hermes-dashboard.service || return 69
+  HERMES_HOME="$HOME/.hermes" timeout --signal=TERM --kill-after=30s 15m \
+    /usr/bin/python3 "$state_helper" runtime-repair "$repo" --state "$state_dir" || return 69
+}
+
+deploy_production() {
+  local previous_sha="$1"
+  local promoted_sha="$2"
+
+  if [[ -n "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
+    (cd "$repo" && bash -lc "$HERMES_UPDATE_DEPLOY_COMMAND")
+    return
+  fi
+
+  local uv_bin
+  uv_bin="$(command -v uv || true)"
+  if [[ -z "$uv_bin" && -x "$HOME/.hermes/bin/uv" ]]; then
+    uv_bin="$HOME/.hermes/bin/uv"
+  fi
+  if ! git -C "$repo" diff --quiet "$previous_sha" "$promoted_sha" -- pyproject.toml uv.lock; then
+    [[ -n "$uv_bin" ]] || { printf 'uv is required for deployment\n' >&2; return 69; }
+    UV_PROJECT_ENVIRONMENT="$repo/venv" "$uv_bin" sync \
+      --project "$repo" --inexact --extra all --locked
+    "$uv_bin" pip check --python "$repo/venv/bin/python"
+  fi
+  if ! git -C "$repo" diff --quiet "$previous_sha" "$promoted_sha" -- \
+    package.json package-lock.json '*/package.json' '*/package-lock.json' .npmrc; then
+    (cd "$repo" && run_verifier_npm ci --no-audit --no-fund)
+  fi
+  if ! git -C "$repo" diff --quiet "$previous_sha" "$promoted_sha" -- \
+    web apps/shared package.json package-lock.json .npmrc tsconfig.json; then
+    (cd "$repo" && run_verifier_npm run build --workspace web)
+  fi
+  load_deployment_profiles "$previous_sha"
+  repair_production_runtime || return "$?"
+  local unit
+  for unit in "${deployment_profiles[@]}"; do
+    profile_home_for_unit "$unit"
+    (cd "$repo" && HERMES_HOME="$profile_home" "$repo/venv/bin/python" \
+      -m hermes_cli.main config migrate </dev/null)
+    (cd "$repo" && HERMES_HOME="$profile_home" "$repo/venv/bin/python" -c '
+from hermes_cli.gateway import get_service_name, refresh_systemd_unit_if_needed, systemd_unit_is_current
+import sys
+assert get_service_name() + ".service" == sys.argv[1], "profile service name mismatch"
+refresh_systemd_unit_if_needed()
+assert systemd_unit_is_current(), "gateway unit refresh failed"
+' "$unit")
+  done
+  invalidate_update_caches
+  systemctl --user restart hermes-gateway.service hermes-dashboard.service
+  for unit in "${deployment_profiles[@]}"; do
+    [[ "$unit" == hermes-gateway.service ]] && continue
+    systemctl --user restart "$unit"
+  done
+}
+
+verify_production_health() {
+  if [[ -n "${HERMES_UPDATE_HEALTH_COMMAND:-}" ]]; then
+    (cd "$repo" && bash -lc "$HERMES_UPDATE_HEALTH_COMMAND")
+    return
+  fi
+
+  /usr/bin/python3 "$state_helper" runtime-check "$repo" || return 69
+  local dashboard_host="${HERMES_UPDATE_DASHBOARD_HOST:-127.0.0.1}"
+  local expected_sha
+  expected_sha="$(git -C "$repo" rev-parse HEAD)"
+  for _ in $(seq 1 60); do
+    if verify_profile_code "$expected_sha" \
+      && systemctl --user is-active --quiet hermes-dashboard.service \
+      && curl -fsS --max-time 5 http://127.0.0.1:8644/health \
+        | jq -e '.status == "ok"' >/dev/null \
+      && curl -fsS --max-time 5 "http://$dashboard_host:9119/api/health" \
+        | jq -e '.ok == true' >/dev/null \
+      && curl -fsS --max-time 5 "http://$dashboard_host:9119/api/status" \
+        | jq -e '
+          .gateway_running == true and
+          .gateway_state == "running" and
+          .components.gateway.status == "ok" and
+          .components.dashboard.status == "ok" and
+          .components.storage.status == "ok" and
+          .config_version == .latest_config_version
+        ' >/dev/null; then
+        return
+    fi
+    sleep 1
+  done
+  printf 'production health gate failed after 60 attempts\n' >&2
+  return 1
+}
+
+if [[ -f "$pending_file" ]]; then
+  validate_promotion_pending
+  production_sha="$pending_previous"
+  target_sha="$pending_target"
+  read_worktree_status "$repo" "production"
+  if [[ -n "$worktree_status" ]]; then
+    printf 'BLOCKED production checkout is dirty: %s\n' "$repo" >&2
+    exit 73
+  fi
+  current_head="$(git -C "$repo" rev-parse HEAD)"
+  if [[ "$current_head" != "$pending_previous" \
+    && "$current_head" != "$pending_candidate" ]]; then
+    printf 'BLOCKED promotion marker does not match production HEAD\n' >&2
+    exit 75
+  fi
+  if [[ "$mode" == "check" ]]; then
+    printf 'PROMOTION_PENDING previous=%s target=%s candidate=%s\n' \
+      "$pending_previous" "$pending_target" "$pending_candidate"
+    exit 0
+  fi
+  if [[ "$current_head" == "$pending_previous" ]]; then
+    git -C "$repo" merge --ff-only "$pending_candidate"
+  fi
+  bounded_deploy "$pending_previous" "$pending_candidate"
+  verify_production_health
+  finish_repair_state \
+    "$pending_previous" "$pending_target" "$pending_candidate"
+  rm -f -- "$profiles_file"
+  rm -f -- "$pending_file"
+  printf 'RECOVERED_PROMOTION previous=%s target=%s candidate=%s\n' \
+    "$pending_previous" "$pending_target" "$pending_candidate"
+  exit 0
+fi
+
+read_worktree_status "$repo" "production"
+if [[ -n "$worktree_status" ]]; then
+  printf 'BLOCKED production checkout is dirty: %s\n' "$repo" >&2
+  exit 73
+fi
+
+production_sha="$(git -C "$repo" rev-parse HEAD)"
+if [[ -f "$repair_pending_file" ]]; then
+  load_repair_pending
+  if [[ "$production_sha" != "$repair_production" ]]; then
+    printf 'BLOCKED production HEAD changed during pending repair\n' >&2
+    exit 75
+  fi
+  require_commit "$repo" "$repair_production" "repair production"
+  require_commit "$repo" "$repair_target" "repair target"
+  target_sha="$repair_target"
+  if [[ "$repair_phase" != "selected" ]]; then
+    candidate="$repair_candidate"
+    keep_candidate=1
+    if [[ "$mode" != check ]]; then
+      recover_empty_collection_block || exit "$?"
+      recover_controller_budget || exit "$?"
+      recover_verifier_device_block || exit "$?"
+      recover_sandbox_block || exit "$?"
+      recover_test_artifacts || exit "$?"
+      retire_failed_target || exit "$?"
+    fi
+    if [[ -f "$candidate/.git/hermes-repair-blocked" && "$mode" != check ]]; then
+      cat "$candidate/.git/hermes-repair-blocked" >&2
+      exit 78
+    fi
+    candidate_head="$(git -C "$candidate" rev-parse HEAD)"
+    if ! git -C "$candidate" merge-base --is-ancestor \
+      "$production_sha" "$candidate_head"; then
+      printf 'BLOCKED pending candidate moved outside its checkpoint ancestry\n' >&2
+      exit 75
+    fi
+    if [[ "$repair_phase" == "verify" \
+      && "$candidate_head" != "$repair_checkpoint" ]]; then
+      printf 'BLOCKED verify candidate moved past its recorded checkpoint\n' >&2
+      exit 75
+    fi
+    if [[ "$repair_phase" != "verify" ]] \
+      && ! git -C "$candidate" merge-base --is-ancestor \
+        "$repair_checkpoint" "$candidate_head"; then
+      printf 'BLOCKED pending candidate moved outside its checkpoint ancestry\n' >&2
+      exit 75
+    fi
+    if [[ "$repair_phase" != "merge" ]] \
+      && ! git -C "$candidate" merge-base --is-ancestor \
+        "$target_sha" "$candidate_head"; then
+      printf 'BLOCKED pending candidate does not contain its target\n' >&2
+      exit 75
+    fi
+    read_worktree_status "$candidate" "repair candidate"
+    if [[ "$repair_phase" == "verify" && -n "$worktree_status" ]]; then
+      printf 'BLOCKED repair candidate is dirty during verify phase\n' >&2
+      exit 75
+    fi
+  fi
+  printf 'RESUMING_REPAIR production=%s target=%s phase=%s candidate=%s\n' \
+    "$production_sha" "$target_sha" "$repair_phase" "$repair_candidate"
+  if [[ "$mode" == "check" ]]; then
+    printf 'REPAIR_PENDING production=%s target=%s phase=%s candidate=%s\n' \
+      "$production_sha" "$target_sha" "$repair_phase" "$repair_candidate"
+    exit 0
+  fi
+else
+  if [[ -n "${HERMES_UPDATE_TARGET_SHA:-}" ]]; then
+    target_sha="$HERMES_UPDATE_TARGET_SHA"
+    require_commit "$repo" "$target_sha" "fixed target"
+    printf 'FIXED_TARGET production=%s target=%s\n' \
+      "$production_sha" "$target_sha"
+  else
+    fetch_upstream
+    target_sha="$(git -C "$repo" rev-parse 'FETCH_HEAD^{commit}')"
+    require_commit "$repo" "$target_sha" "fetched target"
+  fi
+
+  if git -C "$repo" merge-base --is-ancestor "$target_sha" "$production_sha"; then
+    if [[ "$mode" != check ]]; then
+      if [[ -z "${HERMES_UPDATE_HEALTH_COMMAND:-}" ]]; then
+        load_deployment_profiles "$production_sha"
+      fi
+      if [[ -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]] \
+        && { [[ -d "$state_dir/runtime-repair" ]] \
+          || ! /usr/bin/python3 "$state_helper" runtime-check "$repo"; }; then
+        load_deployment_profiles "$production_sha"
+        printf '%s %s %s\n' "$production_sha" "$target_sha" "$production_sha" >"$pending_file.tmp.$$"
+        mv "$pending_file.tmp.$$" "$pending_file"
+        bounded_deploy "$production_sha" "$production_sha"
+      fi
+      verify_production_health
+      rm -f -- "$pending_file" "$profiles_file"
+    fi
+    printf 'NO_UPDATE production=%s target=%s\n' "$production_sha" "$target_sha"
+    exit 0
+  fi
+
+  printf 'UPDATE_AVAILABLE production=%s target=%s\n' "$production_sha" "$target_sha"
+  if [[ "$mode" == "check" ]]; then
+    exit 0
+  fi
+  write_repair_pending "selected" "-" "-" "-"
+  repair_phase="selected"
+fi
+
+# Shared clones depend on the production object store. Keep the frozen target
+# reachable there even if another process fetches or Git runs maintenance.
+git -C "$repo" update-ref refs/hermes-weekly-update/target "$target_sha"
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ).$$"
+merge_repair_log="$state_dir/${stamp}.merge-repair.jsonl"
+candidate_summary="$state_dir/${stamp}.candidate-summary.txt"
+
+cleanup() {
+  if ((keep_candidate == 0)) \
+    && [[ -n "${candidate:-}" ]] \
+    && candidate_path_is_safe "$candidate"; then
+    rm -rf -- "$candidate"
+  fi
+}
+
+if [[ -z "$candidate" ]]; then
+  candidate="$(mktemp -d "$state_dir/candidate.XXXXXX")"
+  git clone --quiet --shared "$repo" "$candidate"
+  git -C "$candidate" config user.name \
+    "$(git -C "$repo" config user.name || printf 'Hermes weekly updater')"
+  git -C "$candidate" config user.email \
+    "$(git -C "$repo" config user.email || printf 'hermes-updater@localhost')"
+  git -C "$candidate" checkout --quiet -b fleet-update-candidate "$production_sha"
+  write_repair_pending "merge" "$candidate" "$production_sha" "-"
+  repair_phase="merge"
+  repair_checkpoint="$production_sha"
+  repair_failure_log="-"
+  keep_candidate=1
+fi
+
+if [[ -f "$candidate/.git/hermes-repair-blocked" ]]; then
+  cat "$candidate/.git/hermes-repair-blocked" >&2
+  exit 78
+fi
+
+block_candidate() {
+  printf 'BLOCKED %s; target=%s candidate=%s\n' "$1" "$target_sha" "$candidate" \
+    | tee "$candidate/.git/hermes-repair-blocked" >&2
+  exit 78
+}
+
+run_count_file="$candidate/.git/hermes-run-count"
+revision_count_file="$candidate/.git/hermes-controller-runs.$updater_digest"
+run_count=0
+revision_count=0
+[[ ! -f "$run_count_file" ]] || read -r run_count <"$run_count_file"
+[[ ! -f "$revision_count_file" ]] || read -r revision_count <"$revision_count_file"
+if [[ ! "$run_count" =~ ^[0-9]{1,9}$ || ! "$revision_count" =~ ^[0-9]$ ]]; then
+  block_candidate 'invalid service retry counters'
+fi
+if ((revision_count >= 4)); then
+  block_candidate 'controller service retry budget exhausted'
+fi
+printf '%s\n' "$updater_digest" >"$candidate/.git/hermes-controller-revision"
+printf '%s\n' "$((revision_count + 1))" >"$revision_count_file.tmp"
+mv "$revision_count_file.tmp" "$revision_count_file"
+printf '%s\n' "$((run_count + 1))" >"$run_count_file.tmp"
+mv "$run_count_file.tmp" "$run_count_file"
+[[ -f "$candidate/.git/hermes-transaction-started" ]] \
+  || date +%s >"$candidate/.git/hermes-transaction-started"
+
+assert_candidate_unchanged() {
+  local expected="$1"
+  read_worktree_status "$candidate" "verified candidate" || exit 78
+  if ! git -C "$candidate" diff --quiet HEAD -- \
+    || [[ "$(git -C "$candidate" rev-parse HEAD)" != "$expected" ]]; then
+    block_candidate 'verification changed candidate source or HEAD'
+  fi
+  /usr/bin/python3 "$state_helper" artifacts "$candidate" \
+    --state "$state_dir" --expected "$expected" || block_candidate 'cannot archive test artifacts'
+}
+
+repair_candidate() {
+  local reason="$1"
+  local repair_log="$2"
+  local failure_log="$3"
+  local prompt_file="$state_dir/${stamp}.repair-prompt.txt"
+  local budget_file="$candidate/.git/hermes-repair-count"
+  local repair_count=0
+  local before_repair
+  before_repair="$(git -C "$candidate" rev-parse HEAD)"
+  if [[ -f "$budget_file" ]]; then
+    read -r repair_count <"$budget_file"
+  fi
+  if [[ ! "$repair_count" =~ ^(0|[1-9][0-9]?)$ ]] || ((repair_count >= max_repairs)); then
+    block_candidate "total repair budget exhausted or invalid: count=$repair_count limit=$max_repairs"
+  fi
+  if [[ -z "${HERMES_UPDATE_REPAIR_COMMAND:-}" ]]; then
+    # Check the local sandbox before spending model time or a source-repair attempt.
+    bwrap --unshare-net --ro-bind / / /bin/true >"$repair_log" 2>&1 || return 69
+  fi
+  printf '%s\n' "$((repair_count + 1))" >"$budget_file.tmp"
+  mv -f -- "$budget_file.tmp" "$budget_file"
+
+  if [[ -n "${HERMES_UPDATE_REPAIR_COMMAND:-}" ]]; then
+    (cd "$candidate" && bash -lc "$HERMES_UPDATE_REPAIR_COMMAND") || return "$?"
+  else
+  if ! command -v codex >/dev/null 2>&1; then
+    printf 'BLOCKED candidate needs repair but codex is unavailable\n' >&2
+    return 1
+  fi
+
+  {
+    printf '%s\n' 'Repair this fixed Hermes update candidate only.'
+    printf 'Production SHA: %s\n' "$production_sha"
+    printf 'Frozen upstream TARGET_SHA: %s\n' "$target_sha"
+    printf 'Reason: %s\n' "$reason"
+    printf 'Failure log: %s\n' "$failure_log"
+    printf '%s\n' 'Resolve merge conflicts or the demonstrated regressions with the smallest change.'
+    printf '%s\n' 'Use one agent. Do not delegate. Do not edit production, runtime state, services, or updater files.'
+    printf '%s\n' 'Read the candidate contributor and test guidance. Reproduce the failed files first in an isolated test home.'
+    printf '%s\n' 'Do not weaken assertions, skip failures, change the verification gate, or patch code for a download or toolchain failure.'
+    printf '%s\n' 'The service enforces UMask=0077. Tests that require a loose fixture mode must call chmod after file creation.'
+    printf '%s\n' 'Do not fetch or change TARGET_SHA. Run only focused tests; the wrapper verifies all uncached files.'
+    printf '%s\n' 'Mock external browser prerequisites in unit-test fixtures; do not rely on the operator browser cache or install Chromium for mocked subprocess tests.'
+    printf '%s\n' 'Do not edit updater evidence or .git/hermes-* files. Generated untracked test output is archived by the wrapper.'
+    printf '%s\n' 'Commit every repair and leave the worktree clean. Stop if evidence does not support a fix.'
+  } >"$prompt_file"
+
+  timeout --signal=TERM --kill-after=30s 10m codex exec \
+    --ignore-user-config \
+    --ephemeral \
+    --sandbox workspace-write \
+    --add-dir "$candidate/.git" \
+    -c 'approval_policy="never"' \
+    -c 'model_reasoning_effort="medium"' \
+    --disable fast_mode \
+    --json \
+    -C "$candidate" \
+    - <"$prompt_file" >"$repair_log" || return "$?"
+  fi
+  read_worktree_status "$candidate" "repair candidate" || return 1
+  if [[ -z "$worktree_status" \
+    && "$(git -C "$candidate" rev-parse HEAD)" == "$before_repair" ]]; then
+    block_candidate 'repair made no committed progress'
+  fi
+}
+
+verify_candidate() {
+  if [[ -n "${HERMES_UPDATE_VERIFY_COMMAND:-}" ]]; then
+    (cd "$candidate" && bash -lc "$HERMES_UPDATE_VERIFY_COMMAND")
+    return
+  fi
+
+  local uv_bin
+  uv_bin="$(command -v uv || true)"
+  if [[ -z "$uv_bin" && -x "$HOME/.hermes/bin/uv" ]]; then
+    uv_bin="$HOME/.hermes/bin/uv"
+  fi
+  if [[ -z "$uv_bin" ]]; then
+    printf 'uv is required for candidate verification\n' >&2
+    return 69
+  fi
+
+  /usr/bin/python3 "$state_helper" isolate /usr/bin/python3 -c \
+    'import subprocess,sys; subprocess.run(["git","-C",sys.argv[1],"rev-parse","HEAD"],stdout=subprocess.DEVNULL,check=True)' \
+    "$candidate" || return 69
+
+  (
+    cd "$candidate" || exit "$?"
+    # Dependency installation depends on its manifests, configuration and setup
+    # scripts. Test results also depend on the full source tree and interpreter.
+    toolchain_key="locked-deps-v2:$verifier_npm_version:$(node --version 2>/dev/null):$($uv_bin --version)"
+    python_request=3.11
+    [[ ! -x "$repo/venv/bin/python" ]] || python_request="$repo/venv/bin/python"
+    python_deps_key="$toolchain_key:$(readlink -f "$python_request" 2>/dev/null || printf '%s' "$python_request"):$(git ls-files -s -- pyproject.toml uv.lock .python-version setup.py setup.cfg 'requirements*.txt' scripts | sha256sum | cut -d ' ' -f 1)"
+    node_deps_key="$toolchain_key:$(git ls-files -s -- package.json package-lock.json npm-shrinkwrap.json '*/package.json' '*/package-lock.json' '*/npm-shrinkwrap.json' .npmrc '*/.npmrc' scripts | sha256sum | cut -d ' ' -f 1)"
+    cache_dir="$candidate/.git/hermes-verification"
+    install -d -m 0700 "$cache_dir"
+    if [[ ! -x "$candidate/venv/bin/python" \
+      || "$(cat "$cache_dir/python-deps" 2>/dev/null || true)" != "$python_deps_key" ]]; then
+    rm -f -- "$cache_dir/python-gate" "$candidate/.git/hermes-python-results.json" "$candidate/.git/hermes-python-results.jsonl"
+    UV_PROJECT_ENVIRONMENT="$candidate/venv" "$uv_bin" sync \
+      --python "$python_request" --locked \
+      --extra all \
+      --extra dev \
+      --extra anthropic \
+      --extra mistral \
+      --extra fal \
+      --extra modal \
+      --extra daytona \
+      --extra hindsight \
+      --extra parallel-web || exit 69
+    printf '%s\n' "$python_deps_key" >"$cache_dir/python-deps"
+    fi
+    if [[ ! -d "$candidate/node_modules" \
+      || "$(cat "$cache_dir/node-deps" 2>/dev/null || true)" != "$node_deps_key" ]]; then
+      rm -f -- "$cache_dir/python-gate" "$candidate/.git/hermes-python-results.json" "$candidate/.git/hermes-python-results.jsonl"
+      run_verifier_npm ci --no-audit --no-fund || exit 69
+      printf '%s\n' "$node_deps_key" >"$cache_dir/node-deps"
+    fi
+    gate_key="$(git rev-parse 'HEAD^{tree}'):$updater_digest:$toolchain_key:$("$candidate/venv/bin/python" --version 2>/dev/null || true):$(readlink -f "$candidate/venv/bin/python")"
+    # Follow upstream's clean environment and per-file retry contract. Do not
+    # use its wrapper's production-venv fallback or unbounded compileall step.
+    test_home="$(mktemp -d "$candidate/.git/test-home.XXXXXX")"
+    trap 'rm -rf -- "$test_home"' EXIT
+    if [[ -f "$candidate/.git/hermes-legacy-log" ]]; then
+      # Legacy logs used a shared /tmp and cannot satisfy the new isolation key.
+      mv "$candidate/.git/hermes-legacy-log" "$candidate/.git/hermes-legacy-log.not-imported"
+    fi
+    if [[ "$(cat "$cache_dir/python-gate" 2>/dev/null || true)" != "$gate_key" ]]; then
+    /usr/bin/python3 "$state_helper" isolate env -i HOME="$test_home" \
+      PATH="$candidate/venv/bin:$(dirname "$verifier_npm_bin"):$PATH" \
+      TZ=UTC LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONHASHSEED=0 PYTHONUTF8=1 \
+      HERMES_DISABLE_LAZY_INSTALLS=1 \
+      HERMES_TEST_WORKERS="${HERMES_UPDATE_TEST_WORKERS:-4}" \
+      HERMES_TEST_FILE_RETRIES=1 \
+      "$candidate/venv/bin/python" "$state_helper" verify "$candidate" || exit "$?"
+    printf '%s\n' "$gate_key" >"$cache_dir/python-gate"
+    fi
+    ensure_verifier_npm || exit 69
+    /usr/bin/python3 "$state_helper" isolate env -i HOME="$test_home" \
+      PATH="$candidate/venv/bin:$(dirname "$verifier_npm_bin"):$PATH" \
+      TZ=UTC LANG=C.UTF-8 CI=true \
+      "$verifier_npm_bin" run check || exit "$?"
+    /usr/bin/python3 "$state_helper" isolate env -i HOME="$test_home" \
+      PATH="$candidate/venv/bin:$(dirname "$verifier_npm_bin"):$PATH" \
+      TZ=UTC LANG=C.UTF-8 CI=true \
+      "$verifier_npm_bin" run build --workspace web || exit "$?"
+  )
+}
+
+if [[ "$repair_phase" == "merge" ]]; then
+  read_worktree_status "$candidate" "repair candidate"
+  if git -C "$candidate" merge-base --is-ancestor \
+    "$target_sha" "$(git -C "$candidate" rev-parse HEAD)" \
+    && [[ -z "$worktree_status" ]]; then
+    :
+  elif [[ -n "$worktree_status" ]]; then
+    printf 'MERGE_REPAIR_REQUIRED target=%s state=interrupted\n' "$target_sha"
+    repair_candidate "interrupted merge while incorporating TARGET_SHA" \
+      "$merge_repair_log" "inspect unresolved Git conflicts" || exit "$?"
+  elif ! git -C "$candidate" merge --no-edit --no-ff "$target_sha"; then
+    printf 'MERGE_REPAIR_REQUIRED target=%s\n' "$target_sha"
+    repair_candidate "merge conflicts while incorporating TARGET_SHA" \
+      "$merge_repair_log" "inspect unresolved Git conflicts" || exit "$?"
+  fi
+fi
+
+if [[ "$repair_phase" == "repair" ]]; then
+  candidate_head="$(git -C "$candidate" rev-parse HEAD)"
+  read_worktree_status "$candidate" "repair candidate"
+  if [[ -n "$worktree_status" \
+    || "$candidate_head" == "$repair_checkpoint" ]]; then
+    resume_repair_log="$state_dir/${stamp}.resume-repair.jsonl"
+    printf 'TEST_REPAIR_RESUMED log=%s\n' "$repair_failure_log"
+    repair_candidate \
+      "resume interrupted deterministic candidate repair" \
+      "$resume_repair_log" "$repair_failure_log" || exit "$?"
+  fi
+fi
+
+unmerged_paths="$(git -C "$candidate" diff --name-only --diff-filter=U)"
+if [[ -n "$unmerged_paths" ]]; then
+  printf 'BLOCKED unresolved merge conflicts remain after repair\n' >&2
+  exit 1
+fi
+read_worktree_status "$candidate" "repair candidate"
+if [[ -n "$worktree_status" ]]; then
+  printf 'BLOCKED repair left uncommitted candidate changes\n' >&2
+  exit 1
+fi
+candidate_head="$(git -C "$candidate" rev-parse HEAD)"
+if ! git -C "$candidate" merge-base --is-ancestor \
+  "$production_sha" "$candidate_head" \
+  || ! git -C "$candidate" merge-base --is-ancestor \
+    "$target_sha" "$candidate_head"; then
+  printf 'BLOCKED candidate does not contain production and target commits\n' >&2
+  exit 75
+fi
+write_repair_pending "verify" "$candidate" "$candidate_head" "-"
+repair_phase="verify"
+repair_checkpoint="$candidate_head"
+repair_failure_log="-"
+
+verify_attempt=1
+final_verify_log=""
+while ((verify_attempt <= 3)); do
+  verify_log="$state_dir/${stamp}.verify-${verify_attempt}.log"
+  verify_status=0
+  verified_head="$(git -C "$candidate" rev-parse HEAD)"
+  assert_candidate_unchanged "$verified_head"
+  verify_candidate >"$verify_log" 2>&1 || verify_status=$?
+  assert_candidate_unchanged "$verified_head"
+  if ((verify_status == 0)); then
+    final_verify_log="$verify_log"
+    break
+  fi
+  if ((verify_status == 69 || verify_status == 124 || verify_status >= 128)); then
+    printf 'RETRY verification environment failed or was interrupted; status=%s log=%s\n' \
+      "$verify_status" "$verify_log" >&2
+    exit "$verify_status"
+  fi
+  repair_log="$state_dir/${stamp}.test-repair-${verify_attempt}.jsonl"
+  printf 'TEST_REPAIR_REQUIRED attempt=%s log=%s\n' \
+    "$verify_attempt" "$verify_log"
+  candidate_head="$(git -C "$candidate" rev-parse HEAD)"
+  write_repair_pending \
+    "repair" "$candidate" "$candidate_head" "$verify_log"
+  repair_candidate \
+    "deterministic candidate verification failed on attempt $verify_attempt" \
+    "$repair_log" "$verify_log" || exit "$?"
+  read_worktree_status "$candidate" "repair candidate"
+  if [[ -n "$worktree_status" ]]; then
+    printf 'BLOCKED repair left uncommitted candidate changes\n' >&2
+    exit 1
+  fi
+  candidate_head="$(git -C "$candidate" rev-parse HEAD)"
+  if ! git -C "$candidate" merge-base --is-ancestor "$production_sha" "$candidate_head" \
+    || ! git -C "$candidate" merge-base --is-ancestor "$target_sha" "$candidate_head"; then
+    block_candidate 'repair removed production or target ancestry'
+  fi
+  write_repair_pending "verify" "$candidate" "$candidate_head" "-"
+  if ((verify_attempt == 3)); then
+    printf 'REPAIR_PENDING candidate completed 3 bounded verification and repair attempts; target=%s candidate=%s\n' \
+      "$target_sha" "$candidate"
+    exit 75
+  fi
+  ((verify_attempt += 1))
+done
+
+git -C "$candidate" diff --check
+assert_candidate_unchanged "$verified_head"
+candidate_sha="$(git -C "$candidate" rev-parse HEAD)"
+git -C "$candidate" merge-base --is-ancestor "$target_sha" "$candidate_sha"
+if [[ -f "$candidate/.git/hermes-python-results.json" ]]; then
+  cp "$candidate/.git/hermes-python-results.json" "$state_dir/${stamp}.python-results.json"
+fi
+{
+  printf 'production=%s\n' "$production_sha"
+  printf 'target=%s\n' "$target_sha"
+  printf 'candidate=%s\n' "$candidate_sha"
+  printf 'repair_count=%s\n' "$(cat "$candidate/.git/hermes-repair-count" 2>/dev/null || printf 0)"
+  printf 'verify_log=%s\n' "$final_verify_log"
+  git -C "$candidate" diff --name-status "$production_sha" "$candidate_sha"
+} >"$candidate_summary"
+
+if [[ "$(git -C "$repo" rev-parse HEAD)" != "$production_sha" ]]; then
+  printf 'BLOCKED production HEAD changed during candidate verification\n' >&2
+  exit 75
+fi
+read_worktree_status "$repo" "production"
+if [[ -n "$worktree_status" ]]; then
+  printf 'BLOCKED production checkout became dirty during candidate verification\n' >&2
+  exit 73
+fi
+
+git -C "$repo" fetch --quiet "$candidate" "$candidate_sha"
+if [[ -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
+  load_deployment_profiles "$production_sha"
+fi
+promotion_tmp="$pending_file.tmp.$$"
+printf '%s %s %s\n' "$production_sha" "$target_sha" "$candidate_sha" \
+  >"$promotion_tmp"
+mv -f -- "$promotion_tmp" "$pending_file"
+git -C "$repo" merge --ff-only "$candidate_sha"
+bounded_deploy "$production_sha" "$candidate_sha"
+verify_production_health
+finish_repair_state "$production_sha" "$target_sha" "$candidate_sha"
+rm -f -- "$profiles_file"
+rm -f -- "$pending_file"
+keep_candidate=0
+
+printf 'PROMOTED previous=%s target=%s candidate=%s verify_log=%s\n' \
+  "$production_sha" "$target_sha" "$candidate_sha" "$final_verify_log"

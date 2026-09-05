@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Install one immutable package generation, then switch it into use."""
+import argparse
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--stage', type=Path, help='build a test installation in this directory; do not use systemd')
+    args = parser.parse_args()
+    source = Path(__file__).resolve().parent
+    home = args.stage.resolve() if args.stage else Path.home()
+    if not args.stage:
+        for command in ('bash', 'git', 'uv', 'node', 'npm', 'codex', 'bwrap', 'jq', 'curl', 'flock', 'systemctl'):
+            if not shutil.which(command):
+                parser.error(f'missing required command: {command}')
+        if not (home / '.hermes/hermes-agent/.git').is_dir():
+            parser.error('install Hermes Agent in ~/.hermes/hermes-agent first')
+        subprocess.run(['systemctl', '--user', 'show-environment'], check=True, stdout=subprocess.DEVNULL)
+    state = home / '.local/state/hermes-weekly-update'
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (state / 'update.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            parser.error('an update is running; install after it stops')
+        files = [source / 'README.md']
+        for directory in ('bin', 'systemd', 'skills'):
+            files.extend(sorted(p for p in (source / directory).rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc'))
+        digest = hashlib.sha256()
+        for file in files:
+            digest.update(str(file.relative_to(source)).encode() + b'\0' + file.read_bytes())
+        base = home / '.local/share/awesome-hermes-updates'
+        releases = base / 'releases'
+        releases.mkdir(parents=True, exist_ok=True)
+        release = releases / digest.hexdigest()[:20]
+        if not release.exists():
+            staging = Path(tempfile.mkdtemp(prefix='.install-', dir=releases))
+            try:
+                for file in files:
+                    target = staging / file.relative_to(source)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file, target)
+                staging.rename(release)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+        def link(target, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists() and not dest.is_symlink():
+                backup = base / 'previous' / dest.relative_to(home)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                if not backup.exists():
+                    shutil.copy2(dest, backup)
+            temporary = dest.with_name(dest.name + f'.install-{os.getpid()}')
+            temporary.symlink_to(target)
+            temporary.replace(dest)
+        link(release, base / 'current')
+        for file in (release / 'bin').iterdir():
+            link(base / 'current/bin' / file.name, home / '.local/bin' / file.name)
+        for file in (release / 'systemd').iterdir():
+            link(base / 'current/systemd' / file.name, home / '.config/systemd/user' / file.name)
+        config = home / '.config/awesome-hermes-updates/config'
+        config.parent.mkdir(parents=True, exist_ok=True)
+        if not config.exists():
+            config.write_text('# systemd environment file. Set the dashboard listen address if needed.\n# HERMES_UPDATE_DASHBOARD_HOST=127.0.0.1\n')
+            config.chmod(0o600)
+        (base / 'source').write_text(str(source) + '\n')
+    if not args.stage:
+        subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
+        subprocess.run(['systemctl', '--user', 'enable', '--now', 'hermes-weekly-update.timer'], check=True)
+        subprocess.run(['systemctl', '--user', 'enable', 'hermes-weekly-update-recovery.service'], check=True)
+    print(f'Installed Awesome Hermes Updates: {release.name}')
+
+
+if __name__ == '__main__':
+    main()

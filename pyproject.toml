@@ -1,0 +1,11 @@
+[project]
+name = "awesome-hermes-updates"
+version = "0.1.0"
+description = "Verified Hermes Agent updates and recovery"
+requires-python = ">=3.11"
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

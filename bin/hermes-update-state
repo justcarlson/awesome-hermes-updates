@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Durable test evidence and artifact handling for the managed updater."""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+
+def git(repo, *args):
+    return subprocess.check_output(["git", "-C", str(repo), *args])
+
+
+def write_json(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def tracked_clean(repo, expected):
+    return (git(repo, "rev-parse", "HEAD").decode().strip() == expected
+            and not git(repo, "diff", "HEAD", "--name-only")
+            and not git(repo, "ls-files", "--unmerged"))
+
+
+def archive_artifacts(repo, state, expected):
+    if not tracked_clean(repo, expected):
+        raise ValueError("tracked source or HEAD changed")
+    paths = [Path(os.fsdecode(p)) for p in git(
+        repo, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0") if p]
+    if not paths:
+        return
+    archive = state / "test-artifacts" / f"{time.time_ns()}"
+    # Validate the full list before moving anything. Never follow a directory
+    # symlink out of the candidate, or move a tracked source file.
+    for relative in paths:
+        source = repo / relative
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("invalid artifact path")
+        if not source.parent.resolve().is_relative_to(repo.resolve()):
+            raise ValueError("artifact parent escapes candidate")
+        if source.is_dir() and not source.is_symlink():
+            raise ValueError("untracked nested repository requires review")
+        if source.is_symlink():
+            raise ValueError("untracked symlink requires review")
+        with source.open("rb") as stream:
+            sqlite = stream.read(16) == b"SQLite format 3\x00"
+        if source.suffix not in {".log", ".lock", ".tmp", ".sqlite", ".db"} and not sqlite:
+            raise ValueError(f"untracked non-artifact file requires review: {relative}")
+    for relative in paths:
+        source, target = repo / relative, archive / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, target)
+        parent = source.parent
+        while parent != repo:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+    print(f"TEST_ARTIFACTS_ARCHIVED count={len(paths)} path={archive}", flush=True)
+
+
+def source_map(repo):
+    result = {}
+    for record in git(repo, "ls-tree", "-rz", "HEAD").split(b"\0"):
+        if record:
+            metadata, name = record.split(b"\t", 1)
+            result[os.fsdecode(name)] = metadata.decode()
+    return result
+
+
+def test_file(name):
+    path = Path(name)
+    return name.startswith("tests/") and path.name.startswith("test_") and path.suffix == ".py"
+
+
+def signature(files, environment):
+    # Shared fixtures, helper modules, scripts, config and product source are
+    # global inputs. Only individual test modules have separate cache entries.
+    shared = {p: sha for p, sha in files.items() if not test_file(p)}
+    return hashlib.sha256(json.dumps([shared, environment], sort_keys=True).encode()).hexdigest()
+
+
+def runner_module(repo):
+    path = repo / "scripts/run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location("hermes_candidate_test_runner", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def evidence_path(repo):
+    return repo / ".git/hermes-python-results.json"
+
+
+def read_evidence(repo):
+    try:
+        data = json.loads(evidence_path(repo).read_text())
+        if data.get("version") == 1:
+            journal = evidence_path(repo).with_suffix(".jsonl")
+            if journal.exists():
+                for line in journal.read_text().splitlines():
+                    try:
+                        item = json.loads(line)
+                        if (item["signature"] == data.get("signature")
+                                and item["blob"] == data.get("files", {}).get(item["path"])):
+                            data["results"][item["path"]] = item["result"]
+                    except (ValueError, KeyError, TypeError):
+                        continue  # An interrupted final append cannot create a pass.
+            return data
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"version": 1, "files": {}, "results": {}}
+
+
+def environment_key(repo):
+    # Exact locked installation plus the real interpreter; candidate location
+    # is not an input. Increment policy when isolation or runner flags change.
+    return ["isolated-python-v2-private-tmp", sys.version, str(Path(sys.executable).resolve()),
+            os.environ.get("HERMES_UPDATE_PYTHON_ENV_KEY", "")]
+
+
+def seed_log(repo, logfile):
+    """Import only a complete legacy run tied to an unchanged saved checkpoint."""
+    content = logfile.read_text(errors="replace")
+    summary = re.search(r"^=== Summary: (\d+) files, .*\(100% complete\)", content, re.M)
+    if not summary:
+        raise ValueError("legacy verification log is incomplete")
+    results = {m[1]: {"rc": 0 if m[0] == "✓" else 1}
+               for m in re.findall(r"^\[[^\n]*\] ([✓✗]) (tests/\S+\.py) \(", content, re.M)}
+    runner = runner_module(repo)
+    names = {str(p.relative_to(repo)) for p in runner._discover_files([repo / "tests"])}
+    if len(results) != int(summary[1]) or set(results) != names:
+        raise ValueError("legacy verification file coverage does not match candidate")
+    files = source_map(repo)
+    data = {"version": 1, "files": files, "results": results,
+            "signature": signature(files, environment_key(repo)), "source_logs": [str(logfile)]}
+    write_json(evidence_path(repo), data)
+    print(f"PYTHON_EVIDENCE_IMPORTED files={len(results)} log={logfile}")
+
+
+def collected_outcomes(result):
+    return sum(result.get("summary", {}).get(k, 0)
+               for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed"))
+
+
+def verify(repo):
+    runner = runner_module(repo)
+    files = source_map(repo)
+    names = [str(p.relative_to(repo)) for p in runner._discover_files([repo / "tests"])]
+    previous = read_evidence(repo)
+    key = signature(files, environment_key(repo))
+    old_results = previous.get("results", {})
+    results = dict(old_results) if previous.get("signature") == key else {}
+    changed = {p for p in set(previous.get("files", {})) | set(files)
+               if test_file(p) and previous.get("files", {}).get(p) != files.get(p)}
+    # A test module can also supply helpers to other tests. On any reference to
+    # a changed module from another test, fall back to the complete gate.
+    if results and changed:
+        stems = {Path(p).stem for p in changed}
+        for name in names:
+            if name not in changed and any(stem in (repo / name).read_text(errors="replace") for stem in stems):
+                results = {}
+                break
+    for name in changed:
+        results.pop(name, None)
+    selected = [p for p in names if results.get(p, {}).get("rc") != 0]
+    controls = sorted((p for p in names if old_results.get(p, {}).get("summary", {}).get("passed", 0) > 0),
+                      key=lambda p: old_results[p].get("seconds", 0))
+    control_required = repo / ".git/hermes-collection-control-required"
+    if not selected and control_required.exists() and controls:
+        selected = [controls[0]]
+    data = {"version": 1, "signature": key, "files": files, "results": results,
+            "source_logs": previous.get("source_logs", [])}
+    write_json(evidence_path(repo), data)
+    lock = threading.Lock()
+    original = runner._run_one_file
+
+    def recorded(*args, **kwargs):
+        result = original(*args, **kwargs)
+        path, rc, output, summary, elapsed = result
+        with lock:
+            name = str(path.relative_to(repo))
+            # Upstream maps pytest exit 5 (no collected tests) to success.
+            # Preserve that contract and report it separately from passing tests.
+            outcomes = sum(summary.get(k, 0) for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed"))
+            data["results"][name] = {"rc": rc, "summary": summary, "seconds": elapsed,
+                                     "classification": "no_tests_collected" if not rc and not outcomes else "tests"}
+            with evidence_path(repo).with_suffix(".jsonl").open("a") as journal:
+                journal.write(json.dumps({"signature": key, "path": name,
+                                          "blob": files.get(name),
+                                          "result": data["results"][name]}) + "\n")
+        return result
+
+    runner._run_one_file = recorded
+    print(f"PYTHON_PLAN total={len(names)} run={len(selected)} cached={len(names)-len(selected)}", flush=True)
+    if not selected:
+        return 0 if any(collected_outcomes(results.get(p, {})) for p in names) else 1
+    failed_first = [p for p in selected if old_results.get(p, {}).get("rc", 0) != 0]
+    remaining = [p for p in selected if p not in failed_first]
+    durations = runner._load_durations(repo)
+    remaining.sort(key=lambda p: durations.get(p, 0), reverse=True)
+    for batch in (failed_first, remaining):
+        if not batch:
+            continue
+        # Keep upstream's aggregate zero-collected guard meaningful for cached
+        # subsets: run one real test file with an otherwise empty-file batch.
+        if all(not old_results.get(p, {}).get("summary") for p in batch):
+            control = next((p for p in controls if p not in batch), None)
+            if control:
+                batch = [*batch, control]
+                print(f"PYTHON_COLLECTION_CONTROL file={control}", flush=True)
+        sys.argv = [str(repo / "scripts/run_tests_parallel.py"), "--files", ":".join(batch),
+                    "-j", os.environ.get("HERMES_TEST_WORKERS", "4"), "--file-retries", "1"]
+        status = runner.main()
+        write_json(evidence_path(repo), data)
+        if status:
+            return status
+    if (all(data["results"].get(p, {}).get("rc") == 0 for p in names)
+            and any(collected_outcomes(data["results"].get(p, {})) for p in names)):
+        control_required.unlink(missing_ok=True)
+        return 0
+    return 1
+
+
+def validate_empty_recheck(repo, logfile):
+    data = read_evidence(repo)
+    names = {str(p.relative_to(repo)) for p in runner_module(repo)._discover_files([repo / "tests"])}
+    results = data.get("results", {})
+    failed = [r for r in results.values() if r.get("rc") != 0]
+    summaries = re.findall(r"^=== Summary: (\d+) files, \d+ tests passed, (\d+) failed[^\n]*\(100% complete\)",
+                           logfile.read_text(errors="replace"), re.M)
+    legacy_empty = (failed and all(r.get("rc") == 1 and r.get("summary") == {} for r in failed)
+                    and sum(int(count) for count, _ in summaries) == len(names))
+    empty_subset = (not failed and "NO TESTS RAN — 0 collected" in logfile.read_text(errors="replace")
+                    and any(r.get("summary", {}).get("passed", 0) > 0 for r in results.values())
+                    and sum(int(count) for count, _ in summaries)
+                    == sum(r.get("classification") == "no_tests_collected" for r in results.values()))
+    if (data.get("files") != source_map(repo) or set(results) != names
+            or not summaries or any(int(failures) for _, failures in summaries)
+            or not (legacy_empty or empty_subset)):
+        raise ValueError("not a proven empty-collection classification failure")
+    print(f"EMPTY_COLLECTION_RECHECK files={len(failed)}")
+
+
+def runtime_info(repo):
+    sys.path.insert(0, str(repo))
+    from hermes_cli.sqlite_runtime import probe_sqlite_runtime
+    return probe_sqlite_runtime(repo / "venv/bin/python")
+
+
+def runtime_check(repo):
+    if not (repo / "hermes_cli/sqlite_runtime.py").is_file():
+        return 0  # Older upstream revisions do not expose this maintenance API.
+    info = runtime_info(repo)
+    if info is None:
+        print("SQLITE_RUNTIME probe failed", file=sys.stderr)
+        return 69
+    print(f"SQLITE_RUNTIME sqlite={info.sqlite_version_string} safe={not info.wal_reset_vulnerable}")
+    return 69 if info.wal_reset_vulnerable else 0
+
+
+def runtime_repair(repo, state):
+    """Use upstream's staged runtime swap, retaining installed host package identities."""
+    pending = state / "runtime-repair"
+    source = git(repo, "rev-parse", "HEAD").decode().strip()
+    uv = shutil.which("uv")
+    if not uv:
+        raise ValueError("uv is unavailable for the runtime package snapshot")
+    pending.mkdir(mode=0o700, parents=True, exist_ok=True)
+    manifest, packages = pending / "manifest.json", pending / "packages.txt"
+    if manifest.exists():
+        previous = json.loads(manifest.read_text())
+        if previous != {"repo": str(repo), "source": source} or not packages.is_file():
+            raise ValueError("runtime snapshot does not match the deployment")
+    else:
+        frozen = subprocess.check_output([uv, "pip", "freeze", "--python", str(repo / "venv/bin/python")],
+                                         cwd=repo, text=True, timeout=60)
+        packages.write_text(frozen)
+        write_json(manifest, {"repo": str(repo), "source": source})
+    sys.path.insert(0, str(repo))
+    from hermes_cli.managed_uv import ensure_uv, repair_vulnerable_runtime, resolve_uv
+    managed = resolve_uv() or str(ensure_uv())
+    if not managed:
+        raise ValueError("managed uv is unavailable")
+    result = repair_vulnerable_runtime(managed, project_root=repo, venv_dir=repo / "venv")
+    print(f"RUNTIME_REPAIR status={result.status}", flush=True)
+    if runtime_check(repo):
+        raise ValueError("runtime repair did not produce safe SQLite")
+    # Restore the pre-swap package set, including host extras. Explicit project
+    # dependency overrides remain authoritative (for example security upgrades).
+    # A rolling age cutoff must not reject already-installed snapshot versions.
+    subprocess.run([managed, "pip", "install", "--python", str(repo / "venv/bin/python"),
+                    "--no-deps", "--exclude-newer", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "--requirements", str(packages)], cwd=repo, check=True, timeout=600)
+    subprocess.run([managed, "pip", "check", "--python", str(repo / "venv/bin/python")],
+                   cwd=repo, check=True, timeout=60)
+    archive = state / f"runtime-repair-completed.{time.time_ns()}"
+    os.replace(pending, archive)
+    print(f"RUNTIME_PACKAGES_RESTORED evidence={archive}", flush=True)
+
+
+def main():
+    if sys.argv[1:2] == ["isolate"]:
+        if len(sys.argv) < 3:
+            return 64
+        try:
+            os.execvp("bwrap", ["bwrap", "--die-with-parent", "--bind", "/", "/",
+                               "--dev-bind", "/dev", "/dev", "--tmpfs", "/tmp", "--", *sys.argv[2:]])
+        except OSError as error:
+            print(f"verification namespace unavailable: {error}", file=sys.stderr)
+            return 69
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=["artifacts", "seed", "verify", "empty-recheck", "runtime-check", "runtime-repair"])
+    parser.add_argument("repo", type=Path)
+    parser.add_argument("--state", type=Path)
+    parser.add_argument("--expected")
+    parser.add_argument("--log", type=Path)
+    args = parser.parse_args()
+    try:
+        if args.action == "runtime-check":
+            return runtime_check(args.repo)
+        elif args.action == "runtime-repair":
+            runtime_repair(args.repo, args.state)
+        elif args.action == "artifacts":
+            archive_artifacts(args.repo, args.state, args.expected)
+        elif args.action == "empty-recheck":
+            validate_empty_recheck(args.repo, args.log)
+        elif args.action == "seed":
+            seed_log(args.repo, args.log)
+        else:
+            return verify(args.repo)
+    except (OSError, ValueError, KeyError, AttributeError, subprocess.SubprocessError) as exc:
+        print(f"BLOCKED verification evidence: {exc}", file=sys.stderr)
+        return 69 if args.action.startswith("runtime-") else 78
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

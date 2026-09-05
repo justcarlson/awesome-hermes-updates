@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the verified Hermes upstream promotion every Sunday
+
+[Timer]
+OnCalendar=Sun *-*-* 03:15:00 America/New_York
+Persistent=true
+AccuracySec=1min
+Unit=hermes-weekly-update.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume an interrupted Hermes update after login or boot
+After=network-online.target
+ConditionPathExistsGlob=%h/.local/state/hermes-weekly-update/*-pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user start --no-block hermes-weekly-update.service
+
+[Install]
+WantedBy=default.target
