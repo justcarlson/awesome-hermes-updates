@@ -158,3 +158,20 @@ def test_runtime_path_follows_configured_installation(tmp_path):
     assert environment['PATH'].split(':') == [str(tmp_path / 'custom source/venv/bin'),
                                               str(tmp_path / 'custom data/node/bin'),
                                               str(tmp_path / 'custom data/bin'), '/usr/bin', '/bin']
+
+
+def test_recovery_condition_is_parsed_and_matches_only_pending_state(tmp_path):
+    import shutil
+    if not shutil.which('systemd-analyze'):
+        pytest.skip('systemd-analyze is unavailable')
+    state = tmp_path / 'state % [literal]'
+    state.mkdir()
+    settings = config['effective']({'HERMES_UPDATE_STATE_DIR': str(state)}, home=tmp_path, environ={})
+    config['write_units'](tmp_path, settings)
+    unit = tmp_path / '.config/systemd/user/hermes-weekly-update-recovery.service.d/paths.conf'
+    condition = unit.read_text().splitlines()[-1]
+    empty = subprocess.run(['systemd-analyze', 'condition', condition], text=True, capture_output=True)
+    assert empty.returncode != 0
+    (state / 'promotion-pending').touch()
+    pending = subprocess.run(['systemd-analyze', 'condition', condition], text=True, capture_output=True)
+    assert pending.returncode == 0, pending.stdout + pending.stderr
