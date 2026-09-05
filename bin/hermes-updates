@@ -23,7 +23,8 @@ def main():
         configure.add_argument('--' + component.lower(), choices=('auto', 'on', 'off'))
     configure.add_argument('--extras', help='comma-separated Python extras; empty means core dependencies')
     configure.add_argument('--profiles', help='auto, or comma-separated default/profile names')
-    configure.add_argument('--max-repairs', type=int, help='0 (default) through 20; positive values opt into Codex repairs')
+    configure.add_argument('--max-repairs', type=int, help='0 (default) through 20; positive values opt into source repairs')
+    configure.add_argument('--repair-agent', choices=('codex', 'claude'), help='source repair CLI (default: codex)')
     configure.add_argument('--ref', help='upstream Git ref (default: main)')
     configure.add_argument('--no-systemd', action='store_true', help='save settings without using a user service manager')
     schedule = commands.add_parser('schedule', help='set on-demand or a systemd calendar, e.g. "daily"')
@@ -47,6 +48,7 @@ def main():
             print(f"Python extras: {settings['HERMES_UPDATE_EXTRAS'] or '(core only)'}")
             print(f"Profiles: {settings['HERMES_UPDATE_PROFILES']}")
             print(f"Repair attempts: {settings['HERMES_UPDATE_MAX_REPAIRS']}")
+            print(f"Repair agent: {settings['HERMES_UPDATE_REPAIR_AGENT']}")
             print(f"Schedule: {settings['HERMES_UPDATE_SCHEDULE']}")
             print('Installed component selection:', flush=True)
             controller = Path(__file__).resolve().with_name('hermes-weekly-update')
@@ -91,7 +93,7 @@ def main():
                        '--property=NoNewPrivileges=true', '--property=PrivateTmp=true',
                        '--property=ProtectSystem=strict', '--property=ProtectHome=read-only']
             writable = [settings[key] for key in ('HERMES_UPDATE_HOME', 'HERMES_UPDATE_REPO', 'HERMES_UPDATE_STATE_DIR')]
-            writable.extend(str(Path.home() / name) for name in ('.cache', '.local/state', '.npm', '.codex', '.config/systemd/user'))
+            writable.extend(str(Path.home() / name) for name in ('.cache', '.local/state', '.npm', '.codex', '.claude', '.config/systemd/user'))
             command.append('--property=ReadWritePaths=' + ' '.join(config['unit_path']('-' + path) for path in writable))
             for key, value in {**settings, 'HERMES_UPDATE_CONFIG_LOADED': '1', 'PATH': config['runtime_environment'](settings)['PATH']}.items():
                 command.append(f'--setenv={key}={value}')

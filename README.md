@@ -10,14 +10,15 @@ for you.
 
 Each update fixes one upstream commit as its target, verifies a separate
 candidate, and promotes it only after the checks pass. Interrupted work resumes
-from saved state. Optional Codex repairs have an explicit attempt limit.
+from saved state. Optional Codex or Claude Code repairs have an explicit attempt limit.
 
 ## Install
 
 Supported: Linux, system Python 3.11+, Bash, Git, and a writable Hermes Git checkout.
 The default checkout is `~/.hermes/hermes-agent`; an installed Python environment
 is detected at `<checkout>/venv`. A user systemd manager provides scheduling and
-resource limits. Custom checkout and Hermes data paths are supported.
+resource limits. Custom checkout and Hermes data paths are supported. macOS and
+other platforms are not yet supported; the installer rejects them explicitly.
 
 ```sh
 gh repo clone justcarlson/awesome-hermes-updates ~/projects/awesome-hermes-updates
@@ -34,7 +35,8 @@ For a different installation:
 The installer can run before Hermes is configured. Native candidate verification
 needs uv and Bubblewrap with working namespaces; targets with a frontend also
 need Node/npm. These are updater tools, not requirements to configure a gateway,
-provider, or dashboard. Codex is needed only if you opt into source repairs.
+provider, or dashboard. An authenticated Codex or Claude Code CLI is needed only
+if you opt into source repairs; normal updates work without either client.
 Unsupported target verifier layouts stop with an explanation and saved evidence.
 
 New installations are **on demand**. Reinstallation preserves your settings,
@@ -128,8 +130,20 @@ Use `hermes-updates configure --ref TAG` to select a ref instead of upstream
 `main`. `HERMES_UPDATE_TARGET_SHA` selects a full commit already fetched locally.
 Saved transactions take precedence over a newly requested target.
 
-Source repair defaults to zero attempts. To opt in with an authenticated Codex
-CLI, use `hermes-updates configure --max-repairs 4`. Each attempt has ten minutes.
+Source repair defaults to zero attempts. Choose an authenticated repair CLI explicitly:
+
+```sh
+hermes-updates configure --repair-agent codex --max-repairs 4
+# Or use Claude Code:
+hermes-updates configure --repair-agent claude --max-repairs 4
+```
+
+`HERMES_UPDATE_REPAIR_AGENT` selects `codex` (the compatibility default) or `claude`.
+Both use the same fixed candidate, verification gate, and saved attempt budget.
+Each attempt has ten minutes.
+Claude repairs require Claude Code 2.1.246+, Bubblewrap, and socat. Complete login
+with `CLAUDE_CONFIG_DIR="$HOME/.claude" claude auth login` before unattended use;
+the updater uses that directory for credentials and writable CLI state.
 Systemd runs allow four test workers, six CPU cores, 8 GiB memory, no swap, and
 four hours per run. Deployment retries and source repair budgets are bounded.
 
@@ -141,10 +155,40 @@ clear a failure. Inspect the saved verification log for an unsupported target
 or failed gate. A bounded stop is a failure with evidence, not a successful update.
 
 Reinstall after `git pull --ff-only` to update this package. The
-[operator skill](skills/hermes-weekly-update/SKILL.md) describes recovery checks;
-install both directories in [`skills/`](skills/) into your agent's skill store
-if you want an agent to operate the updater. Research and the implementation /
-review task graph are in [docs/research.md](docs/research.md).
+[operator skill](skills/update-hermes-agent/SKILL.md) describes the workflow, with
+[recovery details](skills/update-hermes-agent/references/recovery.md) loaded when
+needed. Earlier implementation research is in [docs/research.md](docs/research.md).
+
+## Use with Codex or Claude Code
+
+Install the updater and its single `update-hermes-agent` skill for either client:
+
+```sh
+./install --skills both
+# Or: ./install --skills codex
+# Or: ./install --skills claude
+```
+
+The installer links the skill into `~/.agents/skills/` for Codex and
+`~/.claude/skills/` for Claude Code. Both links follow the installed package's
+atomic `current` generation. Restart the client if it has not discovered the skill.
+Invoke `$update-hermes-agent` in Codex or `/update-hermes-agent` in Claude Code,
+or ask the agent to configure, check, run, schedule, or recover a Hermes update.
+
+Omitting `--skills` preserves your previous selection; first installations default
+to no client links. `--skills none` removes only links this installer owns.
+User-edited copies are preserved: move an existing conflicting copy aside before
+selecting that client. If you manually installed the old `hermes-weekly-update`
+skill, remove that obsolete copy from your skill store after switching to
+`update-hermes-agent`. Its recovery guidance now lives beside the main skill.
+
+For project-scoped installation, place the complete skill directory in
+`.agents/skills/` (Codex) or `.claude/skills/` (Claude Code). Native plugin manifests
+are also included for both clients and share the same `skills/` directory. Choose
+one skill installation method per client to avoid duplicate discovery. Plugin
+loading installs agent instructions; run `./install` separately for the updater.
+See [client compatibility](docs/agent-compatibility.md) for verified requirements
+and local plugin loading.
 
 ## Develop
 

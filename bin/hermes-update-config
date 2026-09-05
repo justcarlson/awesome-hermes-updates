@@ -15,7 +15,8 @@ import tempfile
 
 COMPONENTS = ('PYTHON', 'NODE', 'DASHBOARD', 'GATEWAY', 'MIGRATE', 'RUNTIME')
 DEFAULTS = {**{f'HERMES_UPDATE_{name}': 'auto' for name in COMPONENTS},
-            'HERMES_UPDATE_MAX_REPAIRS': '0', 'HERMES_UPDATE_EXTRAS': '',
+            'HERMES_UPDATE_MAX_REPAIRS': '0', 'HERMES_UPDATE_REPAIR_AGENT': 'codex',
+            'HERMES_UPDATE_EXTRAS': '',
             'HERMES_UPDATE_PROFILES': 'auto', 'HERMES_UPDATE_REF': 'main',
             'HERMES_UPDATE_TEST_WORKERS': '4', 'HERMES_UPDATE_SCHEDULE': 'on-demand'}
 ADVANCED = ('DASHBOARD_HOST', 'DEPLOY_COMMAND', 'HEALTH_COMMAND', 'REPAIR_COMMAND',
@@ -64,6 +65,8 @@ def effective(values, home=None, environ=None):
         key = f'HERMES_UPDATE_{component}'
         if settings[key] not in ('auto', 'on', 'off'):
             raise ValueError(f'{key} must be auto, on, or off')
+    if settings['HERMES_UPDATE_REPAIR_AGENT'] not in ('codex', 'claude'):
+        raise ValueError('HERMES_UPDATE_REPAIR_AGENT must be codex or claude')
     for key, lower, upper in (('HERMES_UPDATE_MAX_REPAIRS', 0, 20), ('HERMES_UPDATE_TEST_WORKERS', 1, 64)):
         if not re.fullmatch(r'0|[1-9][0-9]*', settings[key]) or not lower <= int(settings[key]) <= upper:
             raise ValueError(f'{key} must be between {lower} and {upper}')
@@ -95,7 +98,7 @@ def effective(values, home=None, environ=None):
 def prepare_runtime_dirs(home, settings):
     # Optional writable mounts cannot create their missing parent under
     # ProtectHome=read-only. Prepare caches before entering the service sandbox.
-    for path in [Path(home) / name for name in ('.cache', '.npm', '.codex', '.local/state')]:
+    for path in [Path(home) / name for name in ('.cache', '.npm', '.codex', '.claude', '.local/state')]:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
     Path(settings['HERMES_UPDATE_STATE_DIR']).mkdir(parents=True, exist_ok=True, mode=0o700)
 

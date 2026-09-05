@@ -106,6 +106,118 @@ def _python_tool(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
+@pytest.mark.parametrize('agent', ['codex', 'claude'])
+def test_builtin_repair_agents_keep_candidate_and_verification_contract(tmp_path, agent):
+    _, production, home, env = _update_case(tmp_path)
+    fake_bin = tmp_path / 'fake-bin'
+    _python_tool(fake_bin / 'bwrap', 'raise SystemExit(0)\n')
+    _python_tool(fake_bin / 'socat', 'raise SystemExit(0)\n')
+    _python_tool(fake_bin / agent, '''
+        import json, os, pathlib, subprocess, sys
+        if '--version' in sys.argv:
+            print('2.1.246 (Claude Code)')
+            raise SystemExit(0)
+        arguments = sys.argv[1:]
+        if '-C' in arguments:
+            os.chdir(arguments[arguments.index('-C') + 1])
+        pathlib.Path(os.environ['AGENT_CALL']).write_text(json.dumps({
+            'arguments': arguments, 'cwd': os.getcwd(), 'prompt': sys.stdin.read(),
+            'config_dir': os.environ.get('CLAUDE_CONFIG_DIR')}))
+        pathlib.Path('repaired.txt').write_text('fixed regression\\n')
+        subprocess.run(['git', 'add', 'repaired.txt'], check=True)
+        subprocess.run(['git', 'commit', '-m', 'repair demonstrated regression'], check=True)
+    ''')
+    env.pop('HERMES_UPDATE_REPAIR_COMMAND')
+    env.update(PATH=str(fake_bin) + ':' + env['PATH'],
+               HERMES_UPDATE_REPAIR_AGENT=agent,
+               HERMES_UPDATE_VERIFY_COMMAND='test -f repaired.txt',
+               AGENT_CALL=str(tmp_path / 'agent.json'))
+    result = _run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'PROMOTED' in result.stdout
+    assert (production / 'repaired.txt').exists()
+    assert not (home / 'state/repair-pending').exists()
+    call = json.loads((tmp_path / 'agent.json').read_text())
+    assert call['cwd'] != str(production)
+    assert 'Frozen upstream TARGET_SHA:' in call['prompt']
+    assert 'Do not delegate.' in call['prompt']
+    arguments = call['arguments']
+    if agent == 'claude':
+        assert call['config_dir'] == str(home / '.claude')
+        assert arguments[arguments.index('--permission-mode') + 1] == 'dontAsk'
+        assert arguments[arguments.index('--tools') + 1] == 'Bash,Read,Glob,Grep'
+        assert arguments[arguments.index('--setting-sources') + 1] == ''
+        assert '--strict-mcp-config' in arguments
+        assert '--no-session-persistence' in arguments
+        settings = json.loads(arguments[arguments.index('--settings') + 1])
+        assert settings['disableAllHooks'] is True
+        assert settings['fastMode'] is False
+        assert settings['sandbox']['enabled'] is True
+        assert settings['sandbox']['failIfUnavailable'] is True
+        assert settings['sandbox']['allowUnsandboxedCommands'] is False
+        assert settings['sandbox']['excludedCommands'] == []
+        assert settings['sandbox']['network']['allowedDomains'] == []
+    else:
+        assert arguments[arguments.index('--sandbox') + 1] == 'workspace-write'
+        assert '--ignore-user-config' in arguments
+
+
+@pytest.mark.parametrize('version', ['2.1.219 (Claude Code)', 'unrecognized'])
+def test_unsupported_claude_blocks_before_consuming_repair_budget(tmp_path, version):
+    _, production, home, env = _update_case(tmp_path)
+    previous = _git('rev-parse', 'HEAD', cwd=production)
+    fake_bin = tmp_path / 'fake-bin'
+    _python_tool(fake_bin / 'claude', f'print({version!r})\n')
+    env.pop('HERMES_UPDATE_REPAIR_COMMAND')
+    env.update(PATH=str(fake_bin) + ':' + env['PATH'],
+               HERMES_UPDATE_REPAIR_AGENT='claude', HERMES_UPDATE_VERIFY_COMMAND='/bin/false')
+    result = _run(env)
+    assert result.returncode != 0
+    assert 'Claude Code 2.1.246 or newer' in result.stderr
+    assert _git('rev-parse', 'HEAD', cwd=production) == previous
+    candidate = Path(_pending(home)['candidate'])
+    assert not (candidate / '.git/hermes-repair-count').exists()
+
+
+@pytest.mark.parametrize('agent', ['codex', 'claude'])
+@pytest.mark.parametrize('limit', ['0', '4'])
+def test_builtin_repairs_cannot_run_without_budget_and_sandbox(tmp_path, agent, limit):
+    _, production, home, env = _update_case(tmp_path)
+    previous = _git('rev-parse', 'HEAD', cwd=production)
+    fake_bin = tmp_path / 'fake-bin'
+    _python_tool(fake_bin / agent, '''
+        import os, pathlib, sys
+        if '--version' in sys.argv:
+            print('2.1.246 (Claude Code)')
+        else:
+            pathlib.Path(os.environ['AGENT_CALL']).touch()
+    ''')
+    _python_tool(fake_bin / 'bwrap', 'raise SystemExit(1)\n')
+    _python_tool(fake_bin / 'socat', 'raise SystemExit(0)\n')
+    env.pop('HERMES_UPDATE_REPAIR_COMMAND')
+    env.update(PATH=str(fake_bin) + ':' + env['PATH'],
+               HERMES_UPDATE_REPAIR_AGENT=agent, HERMES_UPDATE_MAX_REPAIRS=limit,
+               HERMES_UPDATE_VERIFY_COMMAND='/bin/false',
+               AGENT_CALL=str(tmp_path / 'agent-called'))
+    result = _run(env)
+    assert result.returncode != 0
+    assert not (tmp_path / 'agent-called').exists()
+    assert _git('rev-parse', 'HEAD', cwd=production) == previous
+    candidate = Path(_pending(home)['candidate'])
+    assert not (candidate / '.git/hermes-repair-count').exists()
+
+
+def test_unsupported_platform_stops_before_creating_state(tmp_path):
+    _, _, home, env = _update_case(tmp_path)
+    fake_bin = tmp_path / 'fake-bin'
+    _python_tool(fake_bin / 'uname', "print('Darwin')\n")
+    env['PATH'] = str(fake_bin) + ':' + env['PATH']
+    result = _run(env)
+    assert result.returncode == 78
+    assert 'supports Linux only' in result.stderr
+    assert not (home / 'state').exists()
+
+
 @pytest.mark.parametrize(
     ("bad_state", "shared_only"),
     [("", False), ("sha", False), ("pid", False), ("", True)],
