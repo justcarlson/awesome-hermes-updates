@@ -1,54 +1,61 @@
 ---
 name: update-hermes-agent
-description: Update an existing Hermes Agent installation with its configured scope, verified candidate, and saved recovery state. Supports partially configured and CLI-only installations.
-version: 3.0.0
-author: Hermes Agent
-license: MIT
-metadata:
-  hermes:
-    tags: [update, recovery, hermes-agent]
-    related_skills: [hermes-weekly-update]
+description: Configure, run, schedule, or recover verified Hermes Agent updates on Linux with Awesome Hermes Updates. Use for existing installations, including unconfigured checkouts and CLI-only setups.
 ---
 
 # Update Hermes Agent
 
-Read the installed package README and `hermes-weekly-update` operator skill.
-Use this package's configured installation and scope. Do not assume a provider,
-gateway, dashboard, named profile, Codex authentication, or schedule exists.
-Do not invent a remote host or a host-specific connection command.
+Operate the installed `hermes-updates` command with the user's configured scope.
+This skill works in Codex and Claude Code; the updater currently supports Linux.
+Keep the selected target, saved recovery state, and attempt budgets across retries.
 
-## Run
+## Inspect
 
-1. Use `hermes-updates config` and `hermes-updates plan` to inspect the installation,
-   selected actions, and optional schedule. Check the configured state directory
-   and any running updater before starting another run.
-2. Use `hermes-updates run` to start and wait for a bounded update. For an existing
-   scheduled service run, monitor `hermes-weekly-update.service` and its journal.
-   The lock prevents concurrent updates. On installations explicitly configured
-   without systemd, use `hermes-updates run --direct` with caller-managed limits.
-3. Resume pending work with the same settings and target. The scheduled service
-   owns automatic retries; do not race its restart delay or reset failed counters.
-   A manual run may be repeated within the saved retry budget.
-4. Report success only after the run exits successfully, pending markers are
-   absent, and the installed source contains the recorded target. Check only
-   the selected components and services captured by the transaction. A disabled
-   timer or absent gateway is valid.
+Run `hermes-updates config` and `hermes-updates plan`. These report effective
+settings and installed capabilities without fetching upstream or changing Hermes.
+Read `hermes-updates --help` for commands and subcommand help for options.
 
-## Scope and repairs
+If the command is missing, use the package README's installation instructions
+from the available checkout. An installed copy lives at
+`~/.local/share/awesome-hermes-updates/current/README.md`. Installation paths and
+skill paths are distinct; installing a plugin alone does not install the updater.
 
-Source advances as one shared Git commit. Profile selection scopes migration,
-cache invalidation, and gateway restarts, not independent profile source versions.
-Deployment options do not weaken candidate verification. Dependencies, dashboard
-builds, migration, gateway maintenance, and runtime repair are individually
-configurable. Never expand scope to clear a failed check without authorization.
+Check the configured `HERMES_UPDATE_STATE_DIR` and any active updater. If there
+is pending state, a failed run, or a scheduled service awaiting restart, read
+[recovery](references/recovery.md) before proceeding. Monitor the existing run
+until its result is known.
 
-Codex repair is opt-in; zero attempts is the default. Dependency/tooling failures
-must not trigger speculative source edits. Failed candidates, logs, and repair
-counters remain available for diagnosis. A safe terminal stop is an update failure.
+## Configure or schedule
 
-Never run the full test matrix in the installed checkout, manually remove pending
-state, reset production Git, or bypass saved budgets. Use the package's update
-path rather than launching a competing `hermes update` transaction.
+When requested, apply only the user's changes with `hermes-updates configure`
+or `hermes-updates schedule`. Preserve all other settings. Finish pending recovery
+before changing deployment scope. Re-read `config` and `plan` to verify the result;
+a configuration-only request ends here.
 
-Report the result, target and installed SHAs, relevant verification evidence,
-repair count, pending state, selected service health, and schedule if enabled.
+Source advances as one shared Git commit. Profiles narrow migration, cache
+invalidation, and gateway restarts; they do not select independent source versions.
+Auto settings detect installed components. An absent provider, gateway, dashboard,
+or schedule is valid. Repairs are optional and default to zero attempts; enabling
+them or expanding component scope requires the user's requested change.
+
+## Run and report
+
+Use `hermes-updates run --check` for a requested upstream check. It selects a target
+without promotion and respects an existing pending target. A check-only request
+ends with the target and pending status.
+
+Use `hermes-updates run` for an update; it waits and streams output within systemd
+resource limits. On a Linux installation configured without systemd, use
+`hermes-updates run --direct` with caller-managed resource limits. Let the updater
+own verification, promotion, locking, and retries. Use its separate candidate for
+verification; never run the full test matrix in the installed checkout or launch
+a competing `hermes update` transaction.
+
+Success requires a successful exit, absent `repair-pending` and `promotion-pending`
+markers, installed source containing the recorded target, and health evidence for
+the selected components. For a failure or interruption, use the recovery reference
+and preserve the evidence. A safe terminal stop is a failed update.
+
+Report the result, target and installed SHAs, verification log or receipt, repair
+count, pending state, and selected service health. Include the next scheduled run
+only when scheduling is enabled. Identify unavailable evidence explicitly.

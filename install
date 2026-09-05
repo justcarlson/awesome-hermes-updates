@@ -18,9 +18,22 @@ def main():
     parser.add_argument('--repo', help='Hermes Agent Git checkout (default: HERMES_HOME/hermes-agent)')
     parser.add_argument('--hermes-home', help='Hermes data directory (default: HERMES_HOME or ~/.hermes)')
     parser.add_argument('--schedule', help='on-demand, or a systemd calendar such as daily; existing schedules are preserved')
+    parser.add_argument('--skills', choices=('codex', 'claude', 'both', 'none'),
+                        help='install the operator skill for these clients; default: preserve previous selection, otherwise none')
     args = parser.parse_args()
+    if sys.platform != 'linux':
+        parser.error('Awesome Hermes Updates currently supports Linux only; macOS support is not implemented')
     source = Path(__file__).resolve().parent
     home = args.stage.resolve() if args.stage else Path.home()
+    base = home / '.local/share/awesome-hermes-updates'
+    skill_selection = base / 'skill-clients'
+    clients = args.skills or (skill_selection.read_text().strip() if skill_selection.exists() else 'none')
+    if clients not in ('codex', 'claude', 'both', 'none'):
+        parser.error(f'invalid saved skill selection in {skill_selection}; pass --skills to replace it')
+    skill_target = base / 'current/skills/update-hermes-agent'
+    skill_links = {client: home / directory / 'skills/update-hermes-agent'
+                   for client, directory in (('codex', '.agents'), ('claude', '.claude'))}
+    selected = set(skill_links) if clients == 'both' else ({clients} if clients != 'none' else set())
     helper = runpy.run_path(str(source / 'bin/hermes-update-config'))
     config = helper['config_path'](home)
     saved = helper['read_config'](config)
@@ -58,14 +71,19 @@ def main():
     if use_systemd:
         helper['check_user_manager']()
     with helper['settings_lock'](previous, reject_pending=bool(args.repo or args.hermes_home)):
+        # Skill stores can contain user-edited copies. Only manage our own links.
+        for client in selected:
+            dest = skill_links[client]
+            managed = dest.is_symlink() and dest.readlink() == skill_target
+            if (dest.exists() or dest.is_symlink()) and not managed:
+                parser.error(f'{dest} already exists and is not managed by this installer; move it aside or choose --skills none')
         helper['prepare_runtime_dirs'](home, settings)
         files = [source / 'README.md']
-        for directory in ('bin', 'systemd', 'skills', 'docs'):
+        for directory in ('bin', 'systemd', 'skills', 'docs', '.codex-plugin', '.claude-plugin'):
             files.extend(sorted(p for p in (source / directory).rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc'))
         digest = hashlib.sha256()
         for file in files:
             digest.update(str(file.relative_to(source)).encode() + b'\0' + file.read_bytes())
-        base = home / '.local/share/awesome-hermes-updates'
         releases = base / 'releases'
         releases.mkdir(parents=True, exist_ok=True)
         release = releases / digest.hexdigest()[:20]
@@ -91,6 +109,16 @@ def main():
             temporary.symlink_to(target)
             temporary.replace(dest)
         link(release, base / 'current')
+        # Some users share skill stores by symlinking the parent directory.
+        selected_locations = {skill_links[client].parent.resolve() / skill_links[client].name
+                              for client in selected}
+        for client, dest in skill_links.items():
+            if client in selected:
+                link(skill_target, dest)
+            elif (dest.parent.resolve() / dest.name not in selected_locations
+                  and dest.is_symlink() and dest.readlink() == skill_target):
+                dest.unlink()
+        helper['atomic_write'](skill_selection, clients + '\n')
         for file in (release / 'bin').iterdir():
             link(base / 'current/bin' / file.name, home / '.local/bin' / file.name)
         if not args.no_systemd:
@@ -113,6 +141,7 @@ def main():
             helper['apply_schedule'](settings)
         helper['systemctl']('enable', 'hermes-weekly-update-recovery.service')
     print(f'Installed Awesome Hermes Updates: {release.name}')
+    print(f'Operator skill clients: {clients}')
 
 
 if __name__ == '__main__':

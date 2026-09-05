@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$(uname -s)" != Linux ]]; then
+  printf 'BLOCKED Awesome Hermes Updates currently supports Linux only\n' >&2
+  exit 78
+fi
+
 package_bin="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 if [[ "${HERMES_UPDATE_CONFIG_LOADED:-}" != 1 ]]; then
   exec /usr/bin/python3 "$package_bin/hermes-update-config" launch "$@"
@@ -19,6 +24,7 @@ target_sha=""
 production_sha=""
 mode="promote"
 max_repairs="${HERMES_UPDATE_MAX_REPAIRS:-0}"
+repair_agent="${HERMES_UPDATE_REPAIR_AGENT:-codex}"
 profiles_file="$state_dir/deployment-profiles"
 state_helper="$(dirname "${BASH_SOURCE[0]}")/hermes-update-state"
 if [[ ! -f "$state_helper" ]]; then
@@ -39,6 +45,10 @@ fi
 install -d -m 0700 "$state_dir"
 if [[ ! "$max_repairs" =~ ^(0|[1-9][0-9]?)$ ]] || ((max_repairs > 20)); then
   printf 'BLOCKED HERMES_UPDATE_MAX_REPAIRS must be between 0 and 20\n' >&2
+  exit 78
+fi
+if [[ "$repair_agent" != codex && "$repair_agent" != claude ]]; then
+  printf 'BLOCKED HERMES_UPDATE_REPAIR_AGENT must be codex or claude\n' >&2
   exit 78
 fi
 exec 9>"$state_dir/update.lock"
@@ -705,6 +715,26 @@ repair_candidate() {
     block_candidate "total repair budget exhausted or invalid: count=$repair_count limit=$max_repairs"
   fi
   if [[ -z "${HERMES_UPDATE_REPAIR_COMMAND:-}" ]]; then
+    if ! command -v "$repair_agent" >/dev/null 2>&1; then
+      printf 'BLOCKED candidate needs repair but %s is unavailable\n' "$repair_agent" >&2
+      return 69
+    fi
+    if [[ "$repair_agent" == claude ]]; then
+      local claude_version
+      claude_version="$(claude --version)" || return 69
+      # Older clients may ignore settings-source isolation for sandbox paths.
+      if [[ ! "$claude_version" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]] \
+        || ! ((10#${BASH_REMATCH[1]} > 2 ||
+          (10#${BASH_REMATCH[1]} == 2 && (10#${BASH_REMATCH[2]} > 1 ||
+          (10#${BASH_REMATCH[2]} == 1 && 10#${BASH_REMATCH[3]} >= 246))))); then
+        printf 'BLOCKED Claude Code 2.1.246 or newer is required for isolated repairs\n' >&2
+        return 69
+      fi
+      if ! command -v socat >/dev/null 2>&1; then
+        printf 'BLOCKED Claude repairs require socat for sandboxing\n' >&2
+        return 69
+      fi
+    fi
     # Check the local sandbox before spending model time or a source-repair attempt.
     bwrap --unshare-net --ro-bind / / /bin/true >"$repair_log" 2>&1 || return 69
   fi
@@ -714,11 +744,6 @@ repair_candidate() {
   if [[ -n "${HERMES_UPDATE_REPAIR_COMMAND:-}" ]]; then
     (cd "$candidate" && bash -lc "$HERMES_UPDATE_REPAIR_COMMAND") || return "$?"
   else
-  if ! command -v codex >/dev/null 2>&1; then
-    printf 'BLOCKED candidate needs repair but codex is unavailable\n' >&2
-    return 1
-  fi
-
   {
     printf '%s\n' 'Repair this fixed Hermes update candidate only.'
     printf 'Production SHA: %s\n' "$production_sha"
@@ -736,7 +761,8 @@ repair_candidate() {
     printf '%s\n' 'Commit every repair and leave the worktree clean. Stop if evidence does not support a fix.'
   } >"$prompt_file"
 
-  timeout --signal=TERM --kill-after=30s 10m codex exec \
+  if [[ "$repair_agent" == codex ]]; then
+    timeout --signal=TERM --kill-after=30s 10m codex exec \
     --ignore-user-config \
     --ephemeral \
     --sandbox workspace-write \
@@ -747,6 +773,21 @@ repair_candidate() {
     --json \
     -C "$candidate" \
     - <"$prompt_file" >"$repair_log" || return "$?"
+  else
+    # Only Bash can mutate files, and every Bash command must stay sandboxed.
+    # Ignore ambient hooks, plugins, MCP servers, and permission grants.
+    # An explicit config root keeps .claude.json and its atomic-write siblings
+    # inside the service's writable mount, alongside the normal credentials.
+    install -d -m 0700 "$HOME/.claude"
+    (cd "$candidate" && CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      timeout --signal=TERM --kill-after=30s 10m claude \
+      --print --verbose --output-format stream-json --no-session-persistence \
+      --effort medium --permission-mode dontAsk \
+      --setting-sources '' --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+      --disable-slash-commands --no-chrome --tools 'Bash,Read,Glob,Grep' \
+      --settings '{"disableAllHooks":true,"fastMode":false,"sandbox":{"enabled":true,"failIfUnavailable":true,"autoAllowBashIfSandboxed":true,"allowUnsandboxedCommands":false,"excludedCommands":[],"network":{"allowedDomains":[]}}}' \
+      <"$prompt_file" >"$repair_log") || return "$?"
+  fi
   fi
   read_worktree_status "$candidate" "repair candidate" || return 1
   if [[ -z "$worktree_status" \

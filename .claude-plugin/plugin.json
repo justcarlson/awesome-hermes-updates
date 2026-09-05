@@ -1,0 +1,5 @@
+{
+  "name": "awesome-hermes-updates",
+  "version": "0.1.0",
+  "description": "Configure and run verified Hermes Agent updates on Linux, with optional scheduling and bounded recovery."
+}

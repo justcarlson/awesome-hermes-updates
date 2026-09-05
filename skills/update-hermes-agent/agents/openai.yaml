@@ -1,0 +1,6 @@
+interface:
+  display_name: "Update Hermes Agent"
+  short_description: "Configure, run, and recover verified Hermes updates"
+  default_prompt: "Use $update-hermes-agent to inspect my Hermes update settings and carry out the update task I requested."
+policy:
+  allow_implicit_invocation: true

@@ -15,6 +15,7 @@ def test_minimal_defaults_follow_custom_hermes_home(tmp_path):
     assert settings['HERMES_UPDATE_REPO'] == str(tmp_path / 'custom/hermes-agent')
     assert settings['HERMES_UPDATE_HOME'] == str(tmp_path / 'custom')
     assert settings['HERMES_UPDATE_MAX_REPAIRS'] == '0'
+    assert settings['HERMES_UPDATE_REPAIR_AGENT'] == 'codex'
     assert settings['HERMES_UPDATE_EXTRAS'] == ''
     assert settings['HERMES_UPDATE_SCHEDULE'] == 'on-demand'
     assert all(settings['HERMES_UPDATE_' + key] == 'auto' for key in config['COMPONENTS'])
@@ -37,6 +38,7 @@ def test_config_roundtrip_is_literal_and_environment_wins(tmp_path):
 @pytest.mark.parametrize('key,value', [
     ('HERMES_UPDATE_REPO', 'relative'), ('HERMES_UPDATE_PYTHON', 'yes'),
     ('HERMES_UPDATE_MAX_REPAIRS', '21'), ('HERMES_UPDATE_MAX_REPAIRS', '-1'),
+    ('HERMES_UPDATE_REPAIR_AGENT', 'other'),
     ('HERMES_UPDATE_TEST_WORKERS', '0'), ('HERMES_UPDATE_PROFILES', '../bad'),
     ('HERMES_UPDATE_PROFILES', ''), ('HERMES_UPDATE_PROFILES', 'x,x'),
     ('HERMES_UPDATE_EXTRAS', 'dev,--bad'), ('HERMES_UPDATE_HOME', '/tmp/x\nInjected=yes'),
@@ -74,6 +76,17 @@ def test_pending_recovery_blocks_scope_change(tmp_path):
     assert result.returncode == 78
     assert 'pending' in result.stderr
     assert not config['config_path'](tmp_path).exists()
+
+
+def test_repair_agent_selection_is_saved_without_enabling_repairs(tmp_path):
+    result = cli(tmp_path, 'configure', '--repair-agent', 'claude', '--no-systemd')
+    assert result.returncode == 0, result.stderr
+    saved = config['read_config'](config['config_path'](tmp_path))
+    settings = config['effective'](saved, home=tmp_path, environ={})
+    assert settings['HERMES_UPDATE_REPAIR_AGENT'] == 'claude'
+    assert settings['HERMES_UPDATE_MAX_REPAIRS'] == '0'
+    assert cli(tmp_path, 'configure', '--repair-agent', 'claude', '--no-systemd').returncode == 0
+    assert config['read_config'](config['config_path'](tmp_path)) == saved
 
 
 def test_unknown_or_duplicate_assignments_rejected(tmp_path):
