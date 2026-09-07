@@ -51,10 +51,12 @@ if [[ "$repair_agent" != codex && "$repair_agent" != claude ]]; then
   printf 'BLOCKED HERMES_UPDATE_REPAIR_AGENT must be codex or claude\n' >&2
   exit 78
 fi
-exec 9>"$state_dir/update.lock"
-if ! flock -n 9; then
-  printf 'BLOCKED another updater run owns %s\n' "$state_dir/update.lock" >&2
-  exit 75
+if [[ "$mode" != plan ]]; then
+  exec 9>"$state_dir/update.lock"
+  if ! flock -n 9; then
+    printf 'BLOCKED another updater run owns %s\n' "$state_dir/update.lock" >&2
+    exit 75
+  fi
 fi
 
 write_receipt() {
@@ -863,7 +865,7 @@ verify_candidate() {
       HERMES_DISABLE_LAZY_INSTALLS=1 \
       HERMES_TEST_WORKERS="${HERMES_UPDATE_TEST_WORKERS:-4}" \
       HERMES_TEST_FILE_RETRIES=1 \
-      "$candidate/venv/bin/python" "$state_helper" verify "$candidate" || exit "$?"
+      "$candidate/venv/bin/python" "$state_helper" verify "$candidate" --state "$state_dir" || exit "$?"
     printf '%s\n' "$gate_key" >"$cache_dir/python-gate"
     fi
     if [[ -f "$candidate/package.json" ]]; then

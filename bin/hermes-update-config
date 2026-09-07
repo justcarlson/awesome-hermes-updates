@@ -154,7 +154,8 @@ def atomic_write(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
     try:
-        with os.fdopen(descriptor, 'w') as output:
+        mode = 'wb' if isinstance(content, bytes) else 'w'
+        with os.fdopen(descriptor, mode) as output:
             output.write(content)
         os.replace(temporary, path)
     finally:
@@ -200,6 +201,32 @@ def write_units(home, settings):
                  '[Timer]\nOnCalendar=\n' + (f'OnCalendar={calendar.replace("%", "%%")}\n' if calendar != 'on-demand' else 'OnCalendar=daily\n'))
 
 
+def managed_paths(path, home):
+    directory = Path(home) / '.config/systemd/user'
+    return (Path(path),
+            directory / 'hermes-weekly-update.service.d/paths.conf',
+            directory / 'hermes-weekly-update-recovery.service.d/paths.conf',
+            directory / 'hermes-weekly-update.timer.d/schedule.conf')
+
+
+def saved_files(paths):
+    return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def restore_files(saved):
+    errors = []
+    for path, content in saved.items():
+        try:
+            if content is None:
+                if path.exists():
+                    path.unlink()
+            else:
+                atomic_write(path, content)
+        except OSError as error:
+            errors.append((path, error))
+    return errors
+
+
 def systemctl(*arguments):
     subprocess.run(['systemctl', '--user', *arguments], check=True)
 
@@ -215,6 +242,60 @@ def apply_schedule(settings):
     else:
         systemctl('enable', '--now', 'hermes-weekly-update.timer')
         systemctl('restart', 'hermes-weekly-update.timer')
+
+
+def timer_state():
+    result = subprocess.run(['systemctl', '--user', 'show', 'hermes-weekly-update.timer',
+                             '--property=UnitFileState', '--property=ActiveState'],
+                            check=True, capture_output=True, text=True)
+    properties = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    enabled, active = properties.get('UnitFileState'), properties.get('ActiveState')
+    if enabled not in ('enabled', 'enabled-runtime', 'disabled') or active not in ('active', 'inactive', 'failed'):
+        raise ValueError(f'cannot safely snapshot timer state: enabled={enabled}, active={active}')
+    return enabled, active == 'active'
+
+
+def restore_timer(enabled, active):
+    if enabled == 'enabled':
+        systemctl('enable', 'hermes-weekly-update.timer')
+    else:
+        systemctl('disable', 'hermes-weekly-update.timer')
+        if enabled == 'enabled-runtime':
+            systemctl('enable', '--runtime', 'hermes-weekly-update.timer')
+    if active:
+        systemctl('restart', 'hermes-weekly-update.timer')
+    else:
+        systemctl('stop', 'hermes-weekly-update.timer')
+
+
+def save_settings(path, home, proposed, updated, use_systemd, apply_timer):
+    paths = managed_paths(path, home) if use_systemd else (Path(path),)
+    saved = saved_files(paths)
+    previous_timer = timer_state() if use_systemd and apply_timer else None
+    try:
+        write_config(path, proposed)
+        if use_systemd:
+            write_units(home, updated)
+            if apply_timer:
+                apply_schedule(updated)
+            else:
+                systemctl('daemon-reload')
+    except (OSError, subprocess.CalledProcessError):
+        errors = restore_files(saved)
+        if errors:
+            print('RECOVERY INCOMPLETE: files were not fully restored; timer recovery was not attempted: ' +
+                  ', '.join(f'{path}: {error}' for path, error in errors), file=sys.stderr)
+            raise
+        if use_systemd:
+            try:
+                if apply_timer:
+                    systemctl('daemon-reload')
+                    restore_timer(*previous_timer)
+                else:
+                    systemctl('daemon-reload')
+            except (OSError, subprocess.CalledProcessError) as error:
+                print(f'RECOVERY INCOMPLETE: could not restore systemd state: {error}', file=sys.stderr)
+        raise
 
 
 def main():

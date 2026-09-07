@@ -146,8 +146,8 @@ def read_evidence(repo):
 
 def environment_key(repo):
     # Exact locked installation plus the real interpreter; candidate location
-    # is not an input. Increment policy when isolation or runner flags change.
-    return ["isolated-python-v2-private-tmp", sys.version, str(Path(sys.executable).resolve()),
+    # is not an input. Increment policy when verification behavior changes.
+    return ["isolated-python-v3-durable-collection", sys.version, str(Path(sys.executable).resolve()),
             os.environ.get("HERMES_UPDATE_PYTHON_ENV_KEY", "")]
 
 
@@ -175,11 +175,24 @@ def collected_outcomes(result):
                for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed"))
 
 
-def verify(repo):
+def verify(repo, state=None):
     runner = runner_module(repo)
     files = source_map(repo)
     names = [str(p.relative_to(repo)) for p in runner._discover_files([repo / "tests"])]
     previous = read_evidence(repo)
+    priority = set()
+    priority_path = state / 'python-failures.json' if state is not None else None
+    if priority_path is not None:
+        try:
+            hints = json.loads(priority_path.read_text())
+            if isinstance(hints, list) and all(isinstance(p, str) for p in hints):
+                priority = set(hints) & set(names)
+        except (OSError, ValueError):
+            pass  # Scheduling hints never establish verification evidence.
+    # Keep the old file map until the replayed journal is removed. A crash must
+    # not restore passes invalidated by a changed test helper.
+    write_json(evidence_path(repo), previous)
+    evidence_path(repo).with_suffix(".jsonl").unlink(missing_ok=True)
     key = signature(files, environment_key(repo))
     old_results = previous.get("results", {})
     results = dict(old_results) if previous.get("signature") == key else {}
@@ -196,7 +209,8 @@ def verify(repo):
     for name in changed:
         results.pop(name, None)
     selected = [p for p in names if results.get(p, {}).get("rc") != 0]
-    controls = sorted((p for p in names if old_results.get(p, {}).get("summary", {}).get("passed", 0) > 0),
+    controls = sorted((p for p in names if old_results.get(p, {}).get("rc") == 0
+                       and collected_outcomes(old_results[p]) > 0),
                       key=lambda p: old_results[p].get("seconds", 0))
     control_required = repo / ".git/hermes-collection-control-required"
     if not selected and control_required.exists() and controls:
@@ -206,6 +220,7 @@ def verify(repo):
     write_json(evidence_path(repo), data)
     lock = threading.Lock()
     original = runner._run_one_file
+    completed = {}
 
     def recorded(*args, **kwargs):
         result = original(*args, **kwargs)
@@ -217,6 +232,7 @@ def verify(repo):
             outcomes = sum(summary.get(k, 0) for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed"))
             data["results"][name] = {"rc": rc, "summary": summary, "seconds": elapsed,
                                      "classification": "no_tests_collected" if not rc and not outcomes else "tests"}
+            completed[name] = data["results"][name]
             with evidence_path(repo).with_suffix(".jsonl").open("a") as journal:
                 journal.write(json.dumps({"signature": key, "path": name,
                                           "blob": files.get(name),
@@ -226,29 +242,55 @@ def verify(repo):
     runner._run_one_file = recorded
     print(f"PYTHON_PLAN total={len(names)} run={len(selected)} cached={len(names)-len(selected)}", flush=True)
     if not selected:
-        return 0 if any(collected_outcomes(results.get(p, {})) for p in names) else 1
-    failed_first = [p for p in selected if old_results.get(p, {}).get("rc", 0) != 0]
+        return 0 if (not control_required.exists()
+                     and any(collected_outcomes(results.get(p, {})) for p in names)) else 1
+    failed_first = [p for p in selected if old_results.get(p, {}).get("rc", 0) != 0 or p in priority]
     remaining = [p for p in selected if p not in failed_first]
     durations = runner._load_durations(repo)
     remaining.sort(key=lambda p: durations.get(p, 0), reverse=True)
     for batch in (failed_first, remaining):
+        batch = [p for p in batch if p not in completed]
         if not batch:
             continue
-        # Keep upstream's aggregate zero-collected guard meaningful for cached
-        # subsets: run one real test file with an otherwise empty-file batch.
-        if all(not old_results.get(p, {}).get("summary") for p in batch):
-            control = next((p for p in controls if p not in batch), None)
-            if control:
-                batch = [*batch, control]
-                print(f"PYTHON_COLLECTION_CONTROL file={control}", flush=True)
         sys.argv = [str(repo / "scripts/run_tests_parallel.py"), "--files", ":".join(batch),
                     "-j", os.environ.get("HERMES_TEST_WORKERS", "4"), "--file-retries", "1"]
+        # Per-file journal writes can finish before the runner's collection guard.
+        control_required.touch()
         status = runner.main()
+        if status == 1 and all(p in completed and completed[p]["rc"] == 0
+                               and not collected_outcomes(completed[p]) for p in batch):
+            if any(r["rc"] == 0 and collected_outcomes(r) for r in completed.values()):
+                status = 0
+            else:
+                for control in (p for p in controls if p not in completed):
+                    print(f"PYTHON_COLLECTION_CONTROL file={control}", flush=True)
+                    sys.argv[2] = control
+                    status = runner.main()
+                    outcome = completed.get(control, {})
+                    if outcome.get('rc') != 0:
+                        status = status or 1
+                        break
+                    if status not in (0, 1) or collected_outcomes(outcome):
+                        break
+                    status = 1
+                else:
+                    # Empty controls do not exhaust an unverified remainder.
+                    # The final gate still requires actual collected outcomes.
+                    if any(p not in completed for p in remaining):
+                        status = 0
         write_json(evidence_path(repo), data)
+        if priority_path is not None:
+            try:
+                priority_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                write_json(priority_path, sorted(p for p in names
+                           if data['results'].get(p, {}).get('rc', 0) != 0
+                           or (p in priority and p not in data['results'])))
+            except OSError as error:
+                print(f'PYTHON_PRIORITY_UNAVAILABLE error={error}', flush=True)
         if status:
             return status
     if (all(data["results"].get(p, {}).get("rc") == 0 for p in names)
-            and any(collected_outcomes(data["results"].get(p, {})) for p in names)):
+            and any(collected_outcomes(r) for r in completed.values())):
         control_required.unlink(missing_ok=True)
         return 0
     return 1
@@ -362,7 +404,7 @@ def main():
         elif args.action == "seed":
             seed_log(args.repo, args.log)
         else:
-            return verify(args.repo)
+            return verify(args.repo, args.state)
     except (OSError, ValueError, KeyError, AttributeError, subprocess.SubprocessError) as exc:
         print(f"BLOCKED verification evidence: {exc}", file=sys.stderr)
         return 69 if args.action.startswith("runtime-") or args.action in ("verify", "verification-extras") else 78
