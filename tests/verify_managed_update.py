@@ -15,6 +15,33 @@ def command(*arguments, cwd=None):
                                         'HERMES_DISABLE_LAZY_INSTALLS': '1'}).strip()
 
 
+def valid_baseline(before, profiles):
+    if not isinstance(before, dict):
+        return False
+    installed_sha = before.get('installed_sha')
+    if not isinstance(installed_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', installed_sha):
+        return False
+    dashboard = before.get('dashboard')
+    if not isinstance(dashboard, dict):
+        return False
+    dashboard_pid = dashboard.get('pid')
+    if not isinstance(dashboard_pid, int) or isinstance(dashboard_pid, bool) or dashboard_pid <= 0:
+        return False
+    gateways = before.get('gateways')
+    if not isinstance(gateways, dict):
+        return False
+    for profile in profiles:
+        gateway = gateways.get(profile)
+        if not isinstance(gateway, dict):
+            return False
+        platform_states = gateway.get('platform_states')
+        if not isinstance(platform_states, dict) or not all(
+                isinstance(name, str) and isinstance(state, str)
+                for name, state in platform_states.items()):
+            return False
+    return True
+
+
 def observe(args):
     checks = {'baseline_available': args.baseline_report is not None}
     details = {'target': args.target}
@@ -73,13 +100,15 @@ def observe(args):
     checks['safe_sqlite_runtime'] = 'safe=True' in runtime
     if args.baseline_report:
         before = json.loads(args.baseline_report.read_text())['details']
-        if before['installed_sha'] != head:
-            checks['dashboard_restarted'] = dashboard_pid > 0 and dashboard_pid != before['dashboard']['pid']
-        for profile in args.profile:
-            old_states = before['gateways'][profile]['platform_states']
-            new_states = details['gateways'][profile]['platform_states']
-            checks[f'connections_preserved_{profile}'] = all(
-                new_states.get(name) == 'connected' for name, state in old_states.items() if state == 'connected')
+        checks['baseline_evidence_valid'] = valid_baseline(before, args.profile)
+        if checks['baseline_evidence_valid']:
+            if before['installed_sha'] != head:
+                checks['dashboard_restarted'] = dashboard_pid > 0 and dashboard_pid != before['dashboard']['pid']
+            for profile in args.profile:
+                old_states = before['gateways'][profile]['platform_states']
+                new_states = details['gateways'][profile]['platform_states']
+                checks[f'connections_preserved_{profile}'] = all(
+                    new_states.get(name) == 'connected' for name, state in old_states.items() if state == 'connected')
     checks['timer_enabled'] = command('systemctl', '--user', 'is-enabled', 'hermes-weekly-update.timer') == 'enabled'
     return {'checks': checks, 'details': details,
             'limits': 'This checks source, processes, receipts, and public dashboard APIs. It does not test provider requests or authenticated chat.'}

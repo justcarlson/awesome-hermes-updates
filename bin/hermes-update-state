@@ -267,7 +267,10 @@ def verify(repo, state=None):
                     sys.argv[2] = control
                     status = runner.main()
                     outcome = completed.get(control, {})
-                    if status not in (0, 1) or outcome.get('rc') != 0 or collected_outcomes(outcome):
+                    if outcome.get('rc') != 0:
+                        status = status or 1
+                        break
+                    if status not in (0, 1) or collected_outcomes(outcome):
                         break
                     status = 1
                 else:

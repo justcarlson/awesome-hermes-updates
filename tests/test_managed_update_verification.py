@@ -217,6 +217,48 @@ def test_missing_baseline_cannot_claim_complete_update_proof(monkeypatch, tmp_pa
     assert report['checks']['baseline_available'] is False
 
 
+@pytest.mark.parametrize('baseline', [
+    {'details': {'installed_sha': None, 'dashboard': {'pid': 111},
+                 'gateways': {'default': {'platform_states': {'healthy': 'connected'}}}}},
+    {'details': {'installed_sha': 'd' * 8, 'dashboard': {'pid': 111},
+                 'gateways': {'default': {'platform_states': {'healthy': 'connected'}}}}},
+    {'details': {'installed_sha': 'd' * 40, 'dashboard': {'pid': 0},
+                 'gateways': {'default': {'platform_states': {'healthy': 'connected'}}}}},
+    {'details': {'installed_sha': 'd' * 40, 'dashboard': {'pid': True},
+                 'gateways': {'default': {'platform_states': {'healthy': 'connected'}}}}},
+    {'details': {'installed_sha': 'd' * 40, 'dashboard': {'pid': 111}, 'gateways': {} }},
+    {'details': {'installed_sha': 'd' * 40, 'dashboard': {'pid': 111},
+                 'gateways': {'default': {'platform_states': None}}}},
+    {'details': {'installed_sha': 'd' * 40, 'dashboard': {'pid': 111},
+                 'gateways': {'default': {'platform_states': {'healthy': None}}}}},
+])
+def test_invalid_baseline_evidence_cannot_pass(monkeypatch, tmp_path, baseline):
+    result, report = run_verifier(monkeypatch, tmp_path, baseline=baseline)
+    assert result == 1
+    assert report['checks']['baseline_evidence_valid'] is False
+
+
+def test_empty_baseline_platform_map_is_valid(monkeypatch, tmp_path):
+    baseline = {'details': {
+        'installed_sha': HEAD, 'dashboard': {'pid': 333},
+        'gateways': {'default': {'platform_states': {}}},
+    }}
+    result, report = run_verifier(monkeypatch, tmp_path, baseline=baseline, platform_states={})
+    assert result == 0
+    assert report['checks']['baseline_evidence_valid'] is True
+    assert report['checks']['connections_preserved_default'] is True
+
+
+def test_baseline_requires_each_selected_profile_but_accepts_empty_music_map():
+    baseline = {'installed_sha': HEAD, 'dashboard': {'pid': 333}, 'gateways': {
+        'default': {'platform_states': {'healthy': 'connected'}},
+        'music': {'platform_states': {}},
+    }}
+    assert verifier.valid_baseline(baseline, ('default', 'music')) is True
+    del baseline['gateways']['music']
+    assert verifier.valid_baseline(baseline, ('default', 'music')) is False
+
+
 def test_upstream_sha_cannot_substitute_for_installed_version_sha(monkeypatch, tmp_path):
     result, report = run_verifier(monkeypatch, tmp_path,
                                  version=f'Hermes Agent v1.2.3 · upstream {HEAD[:8]} · local deadbeef')

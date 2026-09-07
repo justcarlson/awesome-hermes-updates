@@ -672,6 +672,34 @@ def test_empty_historical_control_does_not_hide_a_remaining_real_test(tmp_path, 
 
 
 @pytest.mark.parametrize('outcome', ['passed', 'skipped', 'xfailed'])
+def test_missing_control_result_cannot_reuse_a_cached_pass(tmp_path, outcome):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_last.py').write_text('PASS\n')
+    runner = repo / 'scripts/run_tests_parallel.py'
+    runner.write_text(runner.read_text().replace(
+        '{"failed" if rc else "passed": 1}',
+        '({} if "EMPTY" in path.read_text() else {"failed" if rc else ' + repr(outcome) + ': 1})'
+    ).replace(
+        'return max(_run_one_file(ROOT / path)[1] for path in files)',
+        '''if files == ['tests/test_good.py'] and (ROOT / '.git/omit_control').exists():
+        return 0
+    results = [_run_one_file(ROOT / path) for path in files]
+    return max(r[1] for r in results) if any(r[3] for r in results) else 1'''
+    ))
+    commit(repo)
+    assert run_python(repo).returncode == 1
+    (repo / 'tests/test_bad.py').write_text('EMPTY\n')
+    (repo / 'tests/test_last.py').write_text('PASS AGAIN\n')
+    commit(repo)
+    (repo / '.git/omit_control').touch()
+    result = run_python(repo)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (repo / '.git/hermes-collection-control-required').exists()
+    (repo / '.git/omit_control').unlink()
+    assert run_python(repo).returncode == 0
+
+
+@pytest.mark.parametrize('outcome', ['passed', 'skipped', 'xfailed'])
 def test_interrupted_collected_results_can_supply_a_live_control(tmp_path, outcome):
     repo = python_case(tmp_path)
     (repo / 'tests/test_bad.py').write_text('PASS\n')
