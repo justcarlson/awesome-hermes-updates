@@ -27,6 +27,43 @@ each supported Python version. The saved configuration and repair marker hashes
 were unchanged after installation. The installed `hermes-updates plan` command
 reported the complete component plan while the new managed update was active.
 
+### Managed result
+
+The managed update completed successfully on 2026-09-07 at 03:44:15 UTC. It ran
+for 32 minutes 49 seconds, including one source-repair attempt, full verification,
+dependency deployment, configuration migration, and service restarts.
+
+- Frozen target: `693641aa8b4359c602283bdbbc14041e03bc47bc`.
+- Installed commit: `4a3f4f71141b850396a26deaea8ee219fa257f4b`.
+- Python verification: 3,744 files, 45,519 passed tests, no failed tests, and
+  412 skipped tests. Node checks and the web build also passed.
+- Peak memory: 5,787,815,936 bytes. Swap peak: zero.
+- Repair count: one. The repair changed two stale tests, not product code.
+- Post-update checks: successful terminal service result, clean production,
+  absent pending markers, correct gateway process IDs and source commits,
+  dashboard HTTP health, dashboard restart, safe SQLite, and preserved connections.
+- The temporary repair override was removed after completion. The default
+  repair limit remains zero.
+
+The WAL test now checks the existing PASSIVE checkpoint behavior. The search
+test traces the actual pooled reader. An independent check in a separate copy
+confirmed that disabling checkpoint execution makes the repaired WAL test fail.
+Restoring execution makes it pass again.
+
+The Buzz adapter was retrying before the update and remains so. Core gateway,
+dashboard, and storage health passed. No provider request or authenticated chat
+was used as proof of this update.
+
+Recurring failures were observed about 41 seconds after the new service start,
+compared with 22 minutes 49 seconds in the earlier run. The Python failure batch
+took 17.0 seconds rather than 1,343.4 seconds. These are different upstream
+targets, so this comparison is operational evidence, not a controlled benchmark.
+
+`tests/verify_managed_update.py` records the repeatable post-update checks. It
+accepts a baseline report to detect lost connections and a missing dashboard
+restart after source changes. An active service with a nominal success result,
+pending state, a stale receipt, or incomplete observations cannot produce a pass.
+
 ## Acceptance measures
 
 | Measure | Target |
