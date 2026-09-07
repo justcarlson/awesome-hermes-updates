@@ -16,7 +16,7 @@ def command(*arguments, cwd=None):
 
 
 def observe(args):
-    checks = {}
+    checks = {'baseline_available': args.baseline_report is not None}
     details = {'target': args.target}
     properties = dict(line.split('=', 1) for line in command(
         'systemctl', '--user', 'show', 'hermes-weekly-update.service',
@@ -64,7 +64,9 @@ def observe(args):
                                                  for name in ('gateway', 'dashboard', 'storage'))
     version = command(str(args.repo / 'venv/bin/python'), '-m', 'hermes_cli.main', '--version', cwd=args.repo)
     details['version'] = version
-    checks['version_matches'] = head[:8] in version and f"Hermes Agent v{health.get('version')}" in version
+    local_sha = re.search(r'\blocal ([0-9a-f]{8,40})\b', version)
+    checks['version_matches'] = (local_sha is not None and head.startswith(local_sha[1])
+                                 and f"Hermes Agent v{health.get('version')}" in version)
     runtime = command(sys.executable, str(Path.home() / '.local/bin/hermes-update-state'),
                       'runtime-check', str(args.repo))
     details['runtime'] = runtime
@@ -93,7 +95,7 @@ def main():
     parser.add_argument('--profile', action='append', required=True,
                         help='selected gateway profile; use default for the main home')
     parser.add_argument('--baseline-report', type=Path,
-                        help='pre-update report for process restart and connection comparisons')
+                        help='required for a passing proof; omit only to capture baseline observations')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if not re.fullmatch('[0-9a-f]{40}', args.target):

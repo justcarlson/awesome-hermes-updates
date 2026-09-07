@@ -262,17 +262,19 @@ def verify(repo, state=None):
             if any(r["rc"] == 0 and collected_outcomes(r) for r in completed.values()):
                 status = 0
             else:
-                control = next((p for p in controls if p not in completed), None)
-                if control:
+                for control in (p for p in controls if p not in completed):
                     print(f"PYTHON_COLLECTION_CONTROL file={control}", flush=True)
                     sys.argv[2] = control
                     status = runner.main()
-                    if not collected_outcomes(completed.get(control, {})):
-                        status = status or 1
-                elif any(p not in completed for p in remaining):
-                    # A new candidate has no historical control. Its remaining
-                    # batch must establish collection before the final gate.
-                    status = 0
+                    outcome = completed.get(control, {})
+                    if status not in (0, 1) or outcome.get('rc') != 0 or collected_outcomes(outcome):
+                        break
+                    status = 1
+                else:
+                    # Empty controls do not exhaust an unverified remainder.
+                    # The final gate still requires actual collected outcomes.
+                    if any(p not in completed for p in remaining):
+                        status = 0
         write_json(evidence_path(repo), data)
         if priority_path is not None:
             try:

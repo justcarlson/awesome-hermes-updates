@@ -336,3 +336,86 @@ def test_shared_client_store_keeps_selected_skill(tmp_path, selected):
         assert result.returncode == 0, result.stderr
         assert (codex / 'update-hermes-agent/SKILL.md').is_file()
         assert (claude / 'update-hermes-agent/SKILL.md').is_file()
+
+
+@pytest.mark.parametrize('metadata_form', ['file', 'symlink'])
+def test_failed_install_restores_skill_and_configuration_metadata(tmp_path, monkeypatch, metadata_form):
+    import os
+    import runpy
+    import sys
+
+    result = subprocess.run([str(ROOT / 'install'), '--stage', str(tmp_path), '--skills', 'codex'], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    base = tmp_path / '.local/share/awesome-hermes-updates'
+    config = tmp_path / '.config/awesome-hermes-updates/config'
+    units = tmp_path / '.config/systemd/user'
+    managed = [
+        base / 'skill-clients', base / 'source', config,
+        units / 'hermes-weekly-update.service.d/paths.conf',
+        units / 'hermes-weekly-update-recovery.service.d/paths.conf',
+        units / 'hermes-weekly-update.timer.d/schedule.conf',
+    ]
+    if metadata_form == 'symlink':
+        previous = tmp_path / 'previous-metadata'
+        previous.mkdir()
+        for number, path in enumerate(managed):
+            target = previous / str(number)
+            target.write_bytes(path.read_bytes())
+            path.unlink()
+            path.symlink_to(target)
+    config.write_text('HERMES_UPDATE_REPO=/old/repo\n')
+    config.chmod(0o640)
+    expected = {path: (path.is_symlink(), path.readlink() if path.is_symlink() else path.read_bytes(), path.stat().st_mode & 0o777)
+                for path in managed}
+    codex_skill = tmp_path / '.agents/skills/update-hermes-agent'
+    assert codex_skill.is_symlink()
+
+    installer = runpy.run_path(str(ROOT / 'install'))
+    monkeypatch.setattr(sys, 'argv', ['install', '--stage', str(tmp_path), '--skills', 'none', '--repo', '/new/repo', '--schedule', 'daily'])
+    replace = os.replace
+
+    def fail_current(path, target):
+        if Path(target) == base / 'current':
+            raise OSError('injected activation failure')
+        return replace(path, target)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(os, 'replace', fail_current)
+        with pytest.raises(OSError, match='injected activation failure'):
+            installer['main']()
+
+    assert codex_skill.is_symlink()
+    for path, (was_link, content, mode) in expected.items():
+        assert path.is_symlink() == was_link
+        assert (path.readlink() if was_link else path.read_bytes()) == content
+        assert path.stat().st_mode & 0o777 == mode
+
+
+def test_failed_metadata_restore_retains_original_file_for_recovery(tmp_path, monkeypatch, capsys):
+    import os
+    import runpy
+    import sys
+
+    assert install(tmp_path).returncode == 0
+    base = tmp_path / '.local/share/awesome-hermes-updates'
+    config = tmp_path / '.config/awesome-hermes-updates/config'
+    before = config.read_bytes()
+    installer = runpy.run_path(str(ROOT / 'install'))
+    monkeypatch.setattr(sys, 'argv', ['install', '--stage', str(tmp_path), '--repo', '/new/repo'])
+    replace = os.replace
+
+    def fail_activation_and_config_restore(source, target):
+        if Path(target) == base / 'current':
+            raise OSError('injected activation failure')
+        if Path(target) == config and any(part.startswith('.rollback-') for part in Path(source).parts):
+            raise OSError('injected restore failure')
+        return replace(source, target)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(os, 'replace', fail_activation_and_config_restore)
+        with pytest.raises(OSError, match='injected activation failure'):
+            installer['main']()
+    snapshots = list(base.glob('.rollback-*'))
+    assert len(snapshots) == 1
+    assert (snapshots[0] / config.relative_to(tmp_path)).read_bytes() == before
+    assert 'rollback evidence retained' in capsys.readouterr().err

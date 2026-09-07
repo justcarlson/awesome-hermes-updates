@@ -646,6 +646,31 @@ def test_later_empty_batch_reuses_a_completed_live_control(tmp_path):
     assert not (repo / '.git/hermes-collection-control-required').exists()
 
 
+@pytest.mark.parametrize('invalidate_shared_source', [False, True], ids=['cached-control', 'pending-control'])
+def test_empty_historical_control_does_not_hide_a_remaining_real_test(tmp_path, invalidate_shared_source):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_last.py').write_text('PASS\n')
+    runner = repo / 'scripts/run_tests_parallel.py'
+    runner.write_text(runner.read_text().replace(
+        '{"failed" if rc else "passed": 1}',
+        '({} if "EMPTY" in path.read_text() else {"failed" if rc else "passed": 1})'
+    ).replace(
+        'return max(_run_one_file(ROOT / path)[1] for path in files)',
+        'results = [_run_one_file(ROOT / path) for path in files]\n    return max(r[1] for r in results) if any(r[3] for r in results) else 1'
+    ))
+    commit(repo)
+    assert run_python(repo).returncode == 1
+    (repo / 'tests/test_bad.py').write_text('EMPTY\n')
+    (repo / 'tests/test_good.py').write_text('EMPTY\n')
+    if invalidate_shared_source:
+        (repo / 'runtime.py').write_text('version = 2\n')
+    commit(repo)
+    result = run_python(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls(repo) == ['test_bad.py', 'test_good.py', 'test_last.py'] * 2
+    assert not (repo / '.git/hermes-collection-control-required').exists()
+
+
 @pytest.mark.parametrize('outcome', ['passed', 'skipped', 'xfailed'])
 def test_interrupted_collected_results_can_supply_a_live_control(tmp_path, outcome):
     repo = python_case(tmp_path)

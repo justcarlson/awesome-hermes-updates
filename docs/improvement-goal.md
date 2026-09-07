@@ -60,8 +60,8 @@ took 17.0 seconds rather than 1,343.4 seconds. These are different upstream
 targets, so this comparison is operational evidence, not a controlled benchmark.
 
 `tests/verify_managed_update.py` records the repeatable post-update checks. It
-accepts a baseline report to detect lost connections and a missing dashboard
-restart after source changes. An active service with a nominal success result,
+requires a baseline report for a passing proof. The baseline detects lost
+connections and a missing dashboard restart after source changes. An active service with a nominal success result,
 pending state, a stale receipt, or incomplete observations cannot produce a pass.
 
 ## Acceptance measures

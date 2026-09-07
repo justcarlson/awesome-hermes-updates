@@ -99,7 +99,16 @@ def main():
             finally:
                 if staging.exists():
                     shutil.rmtree(staging)
-        snapshots = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='.rollback-', dir=base)))
+        snapshots = Path(tempfile.mkdtemp(prefix='.rollback-', dir=base))
+        restore_errors = []
+
+        def cleanup_snapshots():
+            if restore_errors:
+                print(f'Error: rollback evidence retained at {snapshots}', file=sys.stderr)
+            else:
+                shutil.rmtree(snapshots)
+
+        cleanup.callback(cleanup_snapshots)
 
         def replace_link(target, dest):
             temporary = dest.with_name(dest.name + f'.install-{os.getpid()}')
@@ -109,23 +118,46 @@ def main():
             finally:
                 temporary.unlink(missing_ok=True)
 
+        snapshotted = set()
+
+        def restore_path(path, state):
+            try:
+                kind, saved = state
+                if kind == 'missing':
+                    path.unlink(missing_ok=True)
+                elif kind == 'symlink':
+                    if not path.is_symlink() or path.readlink() != saved:
+                        replace_link(saved, path)
+                else:
+                    os.replace(saved, path)
+            except OSError as error:
+                restore_errors.append(path)
+                print(f'Error: rollback could not restore {path} from {state}: {error}', file=sys.stderr)
+
+        def snapshot_path(path):
+            if path in snapshotted:
+                return
+            snapshotted.add(path)
+            if path.is_symlink():
+                state = ('symlink', path.readlink())
+            elif path.exists():
+                snapshot = snapshots / path.relative_to(home)
+                snapshot.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, snapshot)
+                state = ('file', snapshot)
+            else:
+                state = ('missing', None)
+            rollback.callback(restore_path, path, state)
+
         def link(target, dest):
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.is_symlink():
-                restore = (replace_link, dest.readlink(), dest)
-            elif dest.exists():
-                snapshot = snapshots / dest.relative_to(home)
-                snapshot.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, snapshot)
-                restore = (os.replace, snapshot, dest)
+            if dest.exists() and not dest.is_symlink():
                 backup = base / 'previous' / dest.relative_to(home)
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 if not backup.exists():
                     shutil.copy2(dest, backup)
-            else:
-                restore = (dest.unlink,)
+            snapshot_path(dest)
             replace_link(target, dest)
-            rollback.callback(*restore)
         # Some users share skill stores by symlinking the parent directory.
         selected_locations = {skill_links[client].parent.resolve() / skill_links[client].name
                               for client in selected}
@@ -134,8 +166,9 @@ def main():
                 link(skill_target, dest)
             elif (dest.parent.resolve() / dest.name not in selected_locations
                   and dest.is_symlink() and dest.readlink() == skill_target):
+                snapshot_path(dest)
                 dest.unlink()
-                rollback.callback(replace_link, skill_target, dest)
+        snapshot_path(skill_selection)
         helper['atomic_write'](skill_selection, clients + '\n')
         for file in (release / 'bin').iterdir():
             link(base / 'current/bin' / file.name, home / '.local/bin' / file.name)
@@ -143,16 +176,28 @@ def main():
             for file in (release / 'systemd').iterdir():
                 link(base / 'current/systemd' / file.name, home / '.config/systemd/user' / file.name)
         if not config.exists() or proposed != saved:
+            snapshot_path(config)
             helper['write_config'](config, proposed)
         if not args.no_systemd:
             # Preserve the pre-configuration weekly timer on upgrade unless the
             # user explicitly changes it. Its old calendar remains in a drop-in.
             timer_dropin = home / '.config/systemd/user/hermes-weekly-update.timer.d/schedule.conf'
             old_calendar = timer_dropin.read_text() if timer_dropin.exists() else None
+            for path in (
+                home / '.config/systemd/user/hermes-weekly-update.service.d/paths.conf',
+                home / '.config/systemd/user/hermes-weekly-update-recovery.service.d/paths.conf',
+                timer_dropin,
+            ):
+                snapshot_path(path)
             helper['write_units'](home, settings)
             if not fresh_timer and not args.schedule and old_calendar is not None:
                 helper['atomic_write'](timer_dropin, old_calendar)
-        (base / 'source').write_text(str(source) + '\n')
+        snapshot_path(base / 'source')
+        source_file = base / 'source'
+        source_mode = source_file.stat().st_mode & 0o777 if source_file.exists() else None
+        helper['atomic_write'](source_file, str(source) + '\n')
+        if source_mode is not None:
+            source_file.chmod(source_mode)
         # Keep the old release selected until every installation file is ready.
         link(release, base / 'current')
         rollback.pop_all()

@@ -19,8 +19,8 @@ HEAD = "b" * 40
 
 def run_verifier(monkeypatch, tmp_path, *, service=None, pending=(), ancestor=True,
                  gateway_pid=172, state_pid=172, state_sha=HEAD, health=None,
-                 status=None, version=None, runtime="safe=True", baseline=None,
-                 dashboard_pid=333, platform_states=None):
+                  status=None, version=None, runtime="safe=True", baseline=None,
+                  dashboard_pid=333, platform_states=None, omit_baseline=False):
     repo = tmp_path / "repo"
     state = tmp_path / "state"
     home = tmp_path / "home"
@@ -48,7 +48,7 @@ def run_verifier(monkeypatch, tmp_path, *, service=None, pending=(), ancestor=Tr
         "gateway": {"status": "ok"}, "dashboard": {"status": "ok"},
         "storage": {"status": "ok"},
     }, "gateway_platforms": gateway_platforms}
-    version = version or f"Hermes Agent v{health['version']} ({HEAD[:8]})"
+    version = version or f"Hermes Agent v{health['version']} · upstream {TARGET[:8]} · local {HEAD[:8]}"
 
     def command(*arguments, cwd=None):
         if arguments[:4] == ("systemctl", "--user", "show", "hermes-weekly-update.service"):
@@ -85,7 +85,10 @@ def run_verifier(monkeypatch, tmp_path, *, service=None, pending=(), ancestor=Tr
                  "--state", str(state), "--target", TARGET,
                  "--dashboard-url", "http://dashboard", "--profile", "default",
                  "--output", str(output)]
-    if baseline:
+    if not omit_baseline:
+        if baseline is None:
+            baseline = {'details': {'installed_sha': 'd' * 40, 'dashboard': {'pid': 111},
+                                   'gateways': {'default': {'platform_states': {'healthy': 'connected'}}}}}
         baseline_path = tmp_path / "baseline.json"
         baseline_path.write_text(json.dumps(baseline))
         arguments.extend(("--baseline-report", str(baseline_path)))
@@ -141,6 +144,7 @@ def test_stale_successful_receipt_for_other_target_fails(monkeypatch, tmp_path):
         "verify-managed-update", "--repo", str(tmp_path / "repo"), "--home", str(tmp_path / "home"),
         "--state", str(state), "--target", TARGET, "--dashboard-url", "http://dashboard",
         "--profile", "default", "--output", str(tmp_path / "stale-report.json"),
+        "--baseline-report", str(tmp_path / 'baseline.json'),
     ])
     assert verifier.main() == 1
     assert json.loads((tmp_path / "stale-report.json").read_text())["checks"]["successful_target_receipt"] is False
@@ -204,3 +208,17 @@ def test_malformed_receipt_replaces_old_success_report(monkeypatch, tmp_path):
     assert verifier.main() == 1
     report = json.loads((tmp_path / 'report.json').read_text())
     assert report['checks']['observation_completed'] is False
+
+
+def test_missing_baseline_cannot_claim_complete_update_proof(monkeypatch, tmp_path):
+    result, report = run_verifier(monkeypatch, tmp_path, omit_baseline=True,
+                                 platform_states={'offline': 'disconnected'})
+    assert result == 1
+    assert report['checks']['baseline_available'] is False
+
+
+def test_upstream_sha_cannot_substitute_for_installed_version_sha(monkeypatch, tmp_path):
+    result, report = run_verifier(monkeypatch, tmp_path,
+                                 version=f'Hermes Agent v1.2.3 · upstream {HEAD[:8]} · local deadbeef')
+    assert result == 1
+    assert report['checks']['version_matches'] is False
