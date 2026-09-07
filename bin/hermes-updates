@@ -70,6 +70,8 @@ def main():
             if use_systemd:
                 config['check_user_manager']()
             with config['settings_lock'](old):
+                if config['read_config'](path) != saved:
+                    raise ValueError('configuration changed before locking; retry the command')
                 config['save_settings'](path, Path.home(), proposed, updated, use_systemd,
                                         args.command == 'schedule')
             print('Saved ' + str(path))

@@ -21,6 +21,45 @@ def test_minimal_defaults_follow_custom_hermes_home(tmp_path):
     assert all(settings['HERMES_UPDATE_' + key] == 'auto' for key in config['COMPONENTS'])
 
 
+@pytest.mark.parametrize('writer', ['configure', 'install'])
+def test_stale_configuration_cannot_overwrite_a_completed_writer(tmp_path, monkeypatch, capsys, writer):
+    from contextlib import contextmanager
+    import sys
+
+    monkeypatch.setenv('HOME', str(tmp_path))
+    for key in list(os.environ):
+        if key.startswith('HERMES_UPDATE_') or key == 'HERMES_HOME':
+            monkeypatch.delenv(key)
+    path = config['config_path'](tmp_path)
+    config['write_config'](path, {'HERMES_UPDATE_GATEWAY': 'auto'})
+    helper = dict(config)
+    winner = {'HERMES_UPDATE_GATEWAY': 'off'}
+
+    @contextmanager
+    def competing_writer(settings, **kwargs):
+        # The other writer completes after our read, but before we take the lock.
+        config['write_config'](path, winner)
+        with config['settings_lock'](settings, **kwargs):
+            yield
+
+    helper['settings_lock'] = competing_writer
+    load = runpy.run_path
+    if writer == 'configure':
+        program = load(str(ROOT / 'bin/hermes-updates'))
+        program['config'].update(helper)
+        monkeypatch.setattr(sys, 'argv', ['hermes-updates', 'configure', '--python', 'off', '--no-systemd'])
+        assert program['main']() == 78
+        assert 'configuration changed' in capsys.readouterr().err
+    else:
+        program = load(str(ROOT / 'install'))
+        monkeypatch.setattr(runpy, 'run_path', lambda source: helper)
+        monkeypatch.setattr(sys, 'argv', ['install', '--stage', str(tmp_path), '--repo', str(tmp_path / 'new')])
+        with pytest.raises(ValueError, match='configuration changed'):
+            program['main']()
+        assert not (tmp_path / '.local/share/awesome-hermes-updates/current').exists()
+    assert config['read_config'](path) == winner
+
+
 def test_config_roundtrip_is_literal_and_environment_wins(tmp_path):
     path = tmp_path / 'config'
     marker = tmp_path / 'must-not-exist'

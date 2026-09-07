@@ -28,7 +28,8 @@ def main():
     home = args.stage.resolve() if args.stage else Path.home()
     base = home / '.local/share/awesome-hermes-updates'
     skill_selection = base / 'skill-clients'
-    clients = args.skills or (skill_selection.read_text().strip() if skill_selection.exists() else 'none')
+    saved_clients = skill_selection.read_text().strip() if skill_selection.exists() else 'none'
+    clients = args.skills or saved_clients
     if clients not in ('codex', 'claude', 'both', 'none'):
         parser.error(f'invalid saved skill selection in {skill_selection}; pass --skills to replace it')
     skill_target = base / 'current/skills/update-hermes-agent'
@@ -72,6 +73,11 @@ def main():
     if use_systemd:
         helper['check_user_manager']()
     with helper['settings_lock'](previous, reject_pending=bool(args.repo or args.hermes_home)), ExitStack() as cleanup, ExitStack() as rollback:
+        if helper['read_config'](config) != saved:
+            raise ValueError('configuration changed before locking; retry the command')
+        current_clients = skill_selection.read_text().strip() if skill_selection.exists() else 'none'
+        if current_clients != saved_clients:
+            raise ValueError('skill selection changed before locking; retry the command')
         # Skill stores can contain user-edited copies. Only manage our own links.
         for client in selected:
             dest = skill_links[client]

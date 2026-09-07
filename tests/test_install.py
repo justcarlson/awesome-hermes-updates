@@ -8,8 +8,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def install(home):
-    return subprocess.run([str(ROOT / 'install'), '--stage', str(home)], capture_output=True, text=True)
+def install(home, *arguments):
+    return subprocess.run([str(ROOT / 'install'), '--stage', str(home), *arguments], capture_output=True, text=True)
 
 
 def test_repeat_install_preserves_settings_and_pending_state(tmp_path):
@@ -419,3 +419,30 @@ def test_failed_metadata_restore_retains_original_file_for_recovery(tmp_path, mo
     assert len(snapshots) == 1
     assert (snapshots[0] / config.relative_to(tmp_path)).read_bytes() == before
     assert 'rollback evidence retained' in capsys.readouterr().err
+
+
+def test_stale_skill_selection_does_not_replace_a_completed_install(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    import runpy
+    import sys
+
+    assert install(tmp_path, '--skills', 'codex').returncode == 0
+    base = tmp_path / '.local/share/awesome-hermes-updates'
+    selected = base / 'skill-clients'
+    helper = runpy.run_path(str(ROOT / 'bin/hermes-update-config'))
+    locking = helper['settings_lock']
+
+    @contextmanager
+    def competing_install(settings, **kwargs):
+        assert install(tmp_path, '--skills', 'none').returncode == 0
+        with locking(settings, **kwargs):
+            yield
+
+    program = runpy.run_path(str(ROOT / 'install'))
+    helper['settings_lock'] = competing_install
+    monkeypatch.setattr(runpy, 'run_path', lambda source: helper)
+    monkeypatch.setattr(sys, 'argv', ['install', '--stage', str(tmp_path)])
+    with pytest.raises(ValueError, match='skill selection changed'):
+        program['main']()
+    assert selected.read_text() == 'none\n'
+    assert not (tmp_path / '.agents/skills/update-hermes-agent').is_symlink()
