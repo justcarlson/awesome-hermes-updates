@@ -70,13 +70,8 @@ def main():
             if use_systemd:
                 config['check_user_manager']()
             with config['settings_lock'](old):
-                config['write_config'](path, proposed)
-                if use_systemd:
-                    config['write_units'](Path.home(), updated)
-                    if args.command == 'schedule':
-                        config['apply_schedule'](updated)
-                    else:
-                        config['systemctl']('daemon-reload')
+                config['save_settings'](path, Path.home(), proposed, updated, use_systemd,
+                                        args.command == 'schedule')
             print('Saved ' + str(path))
         elif args.command == 'run':
             controller = Path(__file__).resolve().with_name('hermes-weekly-update')

@@ -40,6 +40,87 @@ def test_running_update_blocks_install(tmp_path):
     assert not (tmp_path / '.local/share/awesome-hermes-updates/current').exists()
 
 
+@pytest.mark.parametrize('existing', [False, True], ids=['fresh', 'upgrade'])
+@pytest.mark.parametrize('destination', [
+    '.local/bin/hermes-updates',
+    '.config/systemd/user/hermes-weekly-update.service',
+    '.config/systemd/user/hermes-weekly-update.service.d/paths.conf',
+])
+def test_failed_install_does_not_activate_release_and_can_retry(tmp_path, monkeypatch, existing, destination):
+    import os
+    import runpy
+    import shutil
+    import sys
+
+    current = tmp_path / '.local/share/awesome-hermes-updates/current'
+    old = tmp_path / 'old-release'
+    if existing:
+        assert install(tmp_path).returncode == 0
+        shutil.copytree(current.resolve(), old)
+        current.unlink()
+        current.symlink_to(old)
+
+    installer = runpy.run_path(str(ROOT / 'install'))
+    monkeypatch.setattr(sys, 'argv', ['install', '--stage', str(tmp_path)])
+    replace = os.replace
+
+    def fail_replace(path, target):
+        if Path(target) == tmp_path / destination:
+            raise OSError('injected installation write failure')
+        return replace(path, target)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(os, 'replace', fail_replace)
+        with pytest.raises(OSError, match='injected installation write failure'):
+            installer['main']()
+
+    if existing:
+        assert current.resolve() == old
+    else:
+        assert not current.is_symlink()
+        assert not list((tmp_path / '.local/bin').glob('hermes-*'))
+    assert not list(tmp_path.rglob('*.install-*'))
+    installer['main']()
+    assert current.is_symlink()
+    assert current.resolve() != old
+    assert (tmp_path / '.local/bin/hermes-updates').is_file()
+
+
+@pytest.mark.parametrize('kind', ['file', 'symlink'])
+def test_failed_install_preserves_previous_command(tmp_path, monkeypatch, kind):
+    import os
+    import runpy
+    import sys
+
+    command = tmp_path / '.local/bin/hermes-updates'
+    command.parent.mkdir(parents=True)
+    original = tmp_path / 'original-command'
+    original.write_text('#!/bin/sh\necho previous\n')
+    original.chmod(0o751)
+    if kind == 'symlink':
+        command.symlink_to(original)
+    else:
+        command.write_bytes(original.read_bytes())
+        command.chmod(0o751)
+    installer = runpy.run_path(str(ROOT / 'install'))
+    monkeypatch.setattr(sys, 'argv', ['install', '--stage', str(tmp_path)])
+    replace = os.replace
+
+    def fail_unit(path, target):
+        if Path(target).name == 'hermes-weekly-update.service':
+            raise OSError('injected unit failure')
+        return replace(path, target)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(os, 'replace', fail_unit)
+        with pytest.raises(OSError, match='injected unit failure'):
+            installer['main']()
+    assert command.is_symlink() == (kind == 'symlink')
+    assert command.read_bytes() == original.read_bytes()
+    assert command.stat().st_mode & 0o777 == 0o751
+    assert not (tmp_path / '.local/share/awesome-hermes-updates/current').is_symlink()
+
+
 def test_install_without_systemd_or_hermes_setup(tmp_path):
     result = subprocess.run([str(ROOT / 'install'), '--stage', str(tmp_path), '--no-systemd', '--repo', str(tmp_path / 'source')], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

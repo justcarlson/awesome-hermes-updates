@@ -130,7 +130,7 @@ def fake_command(tmp_path, name):
     directory = tmp_path / 'commands'
     directory.mkdir(exist_ok=True)
     command = directory / name
-    command.write_text('#!/usr/bin/env python3\nimport json,os,sys\nwith open(os.environ["COMMAND_LOG"], "a") as log: log.write(json.dumps(sys.argv[1:]) + "\\n")\n')
+    command.write_text('#!/usr/bin/env python3\nimport json,os,sys\nwith open(os.environ["COMMAND_LOG"], "a") as log: log.write(json.dumps(sys.argv[1:]) + "\\n")\nif sys.argv[1:3] == ["--user", "show"]: print("ActiveState=active\\nUnitFileState=enabled")\n')
     command.chmod(0o755)
     return {'PATH': str(directory) + ':' + os.environ['PATH'], 'COMMAND_LOG': str(tmp_path / 'commands.jsonl')}
 
@@ -148,6 +148,179 @@ def test_schedule_changes_timer_and_on_demand_disables_it(tmp_path):
     calls = [json.loads(line) for line in (tmp_path / 'commands.jsonl').read_text().splitlines()]
     assert ['--user', 'disable', '--now', 'hermes-weekly-update.timer'] in calls
     assert config['read_config'](config['config_path'](tmp_path))['HERMES_UPDATE_SCHEDULE'] == 'on-demand'
+
+
+def test_failed_systemd_apply_restores_configuration_and_dropins(tmp_path):
+    result = cli(tmp_path, 'configure', '--gateway', 'off', '--no-systemd')
+    assert result.returncode == 0, result.stderr
+    path = config['config_path'](tmp_path)
+    before = path.read_bytes()
+    environment = fake_command(tmp_path, 'systemctl')
+    command = Path(environment['PATH'].split(':', 1)[0]) / 'systemctl'
+    command.write_text('''#!/usr/bin/env python3
+import sys
+if sys.argv[-1] == 'daemon-reload':
+    sys.exit(1)
+''')
+    command.chmod(0o755)
+
+    result = cli(tmp_path, 'configure', '--gateway', 'on', extra_env=environment)
+
+    assert result.returncode == 78
+    assert path.read_bytes() == before
+    assert not (tmp_path / '.config/systemd/user/hermes-weekly-update.service.d/paths.conf').exists()
+
+
+def test_failed_timer_restart_restores_prior_schedule(tmp_path):
+    result = cli(tmp_path, 'schedule', 'daily', extra_env=fake_command(tmp_path, 'systemctl'))
+    assert result.returncode == 0, result.stderr
+    path = config['config_path'](tmp_path)
+    before = path.read_bytes()
+    schedule = tmp_path / '.config/systemd/user/hermes-weekly-update.timer.d/schedule.conf'
+    before_schedule = schedule.read_bytes()
+    command = tmp_path / 'commands/systemctl'
+    command.write_text('''#!/usr/bin/env python3
+import sys
+if sys.argv[-2:] == ['restart', 'hermes-weekly-update.timer']:
+    sys.exit(1)
+if sys.argv[1:3] == ['--user', 'show']:
+    print('ActiveState=active\\nUnitFileState=enabled')
+''')
+    command.chmod(0o755)
+
+    result = cli(tmp_path, 'schedule', 'weekly', extra_env={'PATH': str(command.parent) + ':' + os.environ['PATH']})
+
+    assert result.returncode == 78
+    assert path.read_bytes() == before
+    assert schedule.read_bytes() == before_schedule
+
+
+def test_failed_schedule_preserves_disabled_inactive_timer(tmp_path):
+    import json
+    command = tmp_path / 'systemctl'
+    log = tmp_path / 'systemctl.jsonl'
+    command.write_text(f'''#!/usr/bin/env python3
+import json,sys
+with open({str(log)!r}, 'a') as output: output.write(json.dumps(sys.argv[1:]) + '\\n')
+if sys.argv[1:3] == ['--user', 'show']:
+    print('ActiveState=inactive\\nUnitFileState=disabled')
+elif sys.argv[-2:] == ['restart', 'hermes-weekly-update.timer']:
+    sys.exit(1)
+''')
+    command.chmod(0o755)
+    environment = {'PATH': str(tmp_path) + ':' + os.environ['PATH']}
+
+    result = cli(tmp_path, 'schedule', 'weekly', extra_env=environment)
+
+    assert result.returncode == 78
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert ['--user', 'disable', 'hermes-weekly-update.timer'] in calls
+    assert ['--user', 'stop', 'hermes-weekly-update.timer'] in calls
+    assert ['--user', 'enable', '--now', 'hermes-weekly-update.timer'] in calls
+
+
+def test_incomplete_file_restore_does_not_apply_prior_timer_state(tmp_path, monkeypatch, capsys):
+    path = config['config_path'](tmp_path)
+    old = config['effective']({'HERMES_UPDATE_SCHEDULE': 'daily'}, home=tmp_path, environ={})
+    updated = config['effective']({'HERMES_UPDATE_SCHEDULE': 'weekly'}, home=tmp_path, environ={})
+    module = config['save_settings'].__globals__
+    applied = []
+
+    monkeypatch.setitem(module, 'write_units', lambda home, settings: None)
+    monkeypatch.setitem(module, 'restore_files', lambda saved: [(path, OSError('restore failed'))])
+    monkeypatch.setitem(module, 'timer_state', lambda: ('disabled', False))
+    def fail_new_schedule(settings):
+        applied.append(settings)
+        raise subprocess.CalledProcessError(1, 'systemctl')
+
+    monkeypatch.setitem(module, 'apply_schedule', fail_new_schedule)
+    with pytest.raises(subprocess.CalledProcessError):
+        config['save_settings'](path, tmp_path, {}, updated, True, True)
+
+    assert applied == [updated]
+    assert 'RECOVERY INCOMPLETE' in capsys.readouterr().err
+
+
+def test_restore_files_continues_after_one_restore_failure(tmp_path, monkeypatch):
+    first = tmp_path / 'first'
+    second = tmp_path / 'second'
+    original_atomic_write = config['atomic_write']
+
+    def fail_first(path, content):
+        if path == first:
+            raise OSError('first restore failed')
+        original_atomic_write(path, content)
+
+    monkeypatch.setitem(config['restore_files'].__globals__, 'atomic_write', fail_first)
+    errors = config['restore_files']({first: b'first', second: b'second'})
+
+    assert len(errors) == 1
+    assert errors[0][0] == first
+    assert 'first restore failed' in str(errors[0][1])
+    assert second.read_bytes() == b'second'
+
+
+@pytest.mark.parametrize('properties', [
+    'ActiveState=active\nUnitFileState=enabled\n',
+    'UnitFileState=enabled\nActiveState=active\n',
+])
+def test_timer_snapshot_uses_property_names_not_output_order(monkeypatch, properties):
+    from types import SimpleNamespace
+    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(stdout=properties))
+    assert config['timer_state']() == ('enabled', True)
+
+
+@pytest.mark.parametrize('properties', [
+    'ActiveState=active\n',
+    'ActiveState=activating\nUnitFileState=enabled\n',
+    'ActiveState=inactive\nUnitFileState=masked\n',
+])
+def test_unknown_or_changing_timer_state_stops_before_writes(monkeypatch, properties):
+    from types import SimpleNamespace
+    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(stdout=properties))
+    with pytest.raises(ValueError, match='timer'):
+        config['timer_state']()
+
+
+def test_runtime_only_timer_enablement_is_not_made_persistent(monkeypatch):
+    calls = []
+    monkeypatch.setitem(config['restore_timer'].__globals__, 'systemctl', lambda *args: calls.append(args))
+    config['restore_timer']('enabled-runtime', False)
+    assert calls == [('disable', 'hermes-weekly-update.timer'),
+                     ('enable', '--runtime', 'hermes-weekly-update.timer'),
+                     ('stop', 'hermes-weekly-update.timer')]
+
+
+def test_partial_dropin_write_restores_prior_files(tmp_path, monkeypatch):
+    path = config['config_path'](tmp_path)
+    old = config['effective']({'HERMES_UPDATE_GATEWAY': 'off'}, home=tmp_path, environ={})
+    proposed = {'HERMES_UPDATE_GATEWAY': 'on'}
+    updated = config['effective'](proposed, home=tmp_path, environ={})
+    config['write_config'](path, {'HERMES_UPDATE_GATEWAY': 'off'})
+    before = path.read_bytes()
+    original_write_units = config['write_units']
+
+    def write_some_units_then_fail(home, settings):
+        original_write_units(home, settings)
+        raise OSError('simulated drop-in write failure')
+
+    module = config['save_settings'].__globals__
+    monkeypatch.setitem(module, 'write_units', write_some_units_then_fail)
+    monkeypatch.setitem(module, 'systemctl', lambda *arguments: None)
+    with pytest.raises(OSError, match='simulated'):
+        config['save_settings'](path, tmp_path, proposed, updated, True, False)
+
+    assert path.read_bytes() == before
+    assert not (tmp_path / '.config/systemd/user/hermes-weekly-update.service.d/paths.conf').exists()
+
+
+def test_manual_configuration_does_not_read_unusable_systemd_files(tmp_path):
+    unused = tmp_path / '.config/systemd/user/hermes-weekly-update.service.d/paths.conf'
+    unused.mkdir(parents=True)
+    result = cli(tmp_path, 'configure', '--gateway', 'off', '--no-systemd')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert unused.is_dir()
+    assert config['read_config'](config['config_path'](tmp_path))['HERMES_UPDATE_GATEWAY'] == 'off'
 
 
 def test_bounded_run_passes_effective_settings_and_check_flag(tmp_path):

@@ -200,3 +200,6 @@ and local plugin loading.
 Tests use temporary repositories and fake deployment tools, including partial
 installations, scope restrictions, schedules, and interrupted updates. The `check`
 command runs shell syntax checks and the regression suite on Python 3.11 and 3.13.
+
+The [improvement goal](docs/improvement-goal.md) defines the speed, reliability,
+and update-success targets, measurement rules, and current evidence limits.

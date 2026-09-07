@@ -106,6 +106,29 @@ def _python_tool(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
+def test_read_only_plan_works_while_an_update_holds_the_lock(tmp_path):
+    import fcntl
+
+    _, production, home, env = _update_case(tmp_path)
+    state = home / 'state'
+    state.mkdir()
+    (state / 'repair-pending').write_text('preserve pending evidence\n')
+    (state / 'last-result').write_text('preserve receipt\n')
+    _python_tool(home / 'bin/systemctl', 'raise SystemExit(1)\n')
+    env['PATH'] = str(home / 'bin') + ':' + env['PATH']
+    previous = _git('rev-parse', 'HEAD', cwd=production)
+    with (state / 'update.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        before = {path.name: path.read_bytes() for path in state.iterdir()}
+        result = subprocess.run([str(WEEKLY_UPDATER), '--plan'], env=env,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'Resolved actions:' in result.stdout
+        assert {path.name: path.read_bytes() for path in state.iterdir()} == before
+        assert _run(env).returncode == 75
+    assert _git('rev-parse', 'HEAD', cwd=production) == previous
+
+
 @pytest.mark.parametrize('agent', ['codex', 'claude'])
 def test_builtin_repair_agents_keep_candidate_and_verification_contract(tmp_path, agent):
     _, production, home, env = _update_case(tmp_path)
@@ -363,6 +386,8 @@ def _default_verifier_tools(home: Path, env: dict[str, str]) -> Path:
         if '--version' in sys.argv:
             print('Python 3.11.0')
             sys.exit(0)
+        assert sys.argv[2] == 'verify'
+        assert sys.argv[-2:] == ['--state', {str(home / 'state')!r}]
         with Path({str(events)!r}).open('a') as log: log.write('python-gate\\n')
         """,
     )

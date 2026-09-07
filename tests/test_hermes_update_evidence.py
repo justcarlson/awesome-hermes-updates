@@ -83,8 +83,9 @@ def main():
     return repo
 
 
-def run_python(repo):
-    return subprocess.run([sys.executable, str(HELPER), "verify", str(repo)], capture_output=True, text=True)
+def run_python(repo, state=None):
+    arguments = [] if state is None else ['--state', str(state)]
+    return subprocess.run([sys.executable, str(HELPER), "verify", str(repo), *arguments], capture_output=True, text=True)
 
 
 def calls(repo):
@@ -116,6 +117,24 @@ def test_runtime_or_shared_fixture_change_invalidates_all_results(tmp_path, chan
     assert calls(repo).count("test_good.py") == 2
 
 
+def test_previous_collection_policy_cannot_satisfy_the_new_gate(tmp_path):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_bad.py').write_text('PASS\n')
+    commit(repo)
+    assert run_python(repo).returncode == 0
+    data = evidence.read_evidence(repo)
+    data['signature'] = evidence.signature(data['files'], [
+        'isolated-python-v2-private-tmp', sys.version,
+        str(Path(sys.executable).resolve()), '',
+    ])
+    evidence.write_json(evidence.evidence_path(repo), data)
+    evidence.evidence_path(repo).with_suffix('.jsonl').unlink()
+    result = run_python(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'run=2 cached=0' in result.stdout
+    assert calls(repo).count('test_good.py') == 2
+
+
 def test_failed_files_run_before_full_gate_and_fail_fast(tmp_path):
     repo = python_case(tmp_path)
     assert run_python(repo).returncode == 1
@@ -125,6 +144,77 @@ def test_failed_files_run_before_full_gate_and_fail_fast(tmp_path):
     assert result.returncode == 1
     assert calls(repo).count("test_good.py") == 1
     assert calls(repo).count("test_bad.py") == 2
+
+
+@pytest.mark.parametrize('fixed', [False, True])
+def test_new_candidate_uses_failure_order_but_never_previous_passes(tmp_path, fixed):
+    state = tmp_path / 'shared-state'
+    first = tmp_path / 'first'
+    second = tmp_path / 'second'
+    first.mkdir()
+    second.mkdir()
+    old = python_case(first)
+    assert run_python(old, state).returncode == 1
+    assert json.loads((state / 'python-failures.json').read_text()) == ['tests/test_bad.py']
+    new = python_case(second)
+    if fixed:
+        (new / 'tests/test_bad.py').write_text('PASS\n')
+        commit(new)
+    result = run_python(new, state)
+    assert result.returncode == (0 if fixed else 1), result.stdout + result.stderr
+    assert 'run=2 cached=0' in result.stdout
+    assert calls(new) == (['test_bad.py', 'test_good.py'] if fixed else ['test_bad.py'])
+    assert json.loads((state / 'python-failures.json').read_text()) == ([] if fixed else ['tests/test_bad.py'])
+
+
+@pytest.mark.parametrize('content', ['invalid json', '{}', '[null]', '["../../outside.py"]'])
+def test_invalid_failure_order_cannot_change_test_coverage(tmp_path, content):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_bad.py').write_text('PASS\n')
+    commit(repo)
+    state = tmp_path / 'shared-state'
+    state.mkdir()
+    (state / 'python-failures.json').write_text(content)
+    result = run_python(repo, state)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(calls(repo)) == ['test_bad.py', 'test_good.py']
+
+
+@pytest.mark.parametrize('fixed', [False, True])
+def test_unwritable_failure_hints_do_not_change_verification_result(tmp_path, fixed):
+    repo = python_case(tmp_path)
+    if fixed:
+        (repo / 'tests/test_bad.py').write_text('PASS\n')
+        commit(repo)
+    state = tmp_path / 'shared-state'
+    (state / 'python-failures.json').mkdir(parents=True)
+    result = run_python(repo, state)
+    assert result.returncode == (0 if fixed else 1), result.stdout + result.stderr
+    assert sorted(calls(repo)) == ['test_bad.py', 'test_good.py']
+    assert 'PYTHON_PRIORITY_UNAVAILABLE' in result.stdout
+
+
+@pytest.mark.parametrize('all_empty', [False, True])
+def test_prior_failure_now_empty_still_checks_the_remaining_files(tmp_path, all_empty):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_bad.py').write_text('EMPTY\n')
+    (repo / 'tests/test_good.py').write_text('EMPTY\n' if all_empty else 'PASS\n')
+    runner = repo / 'scripts/run_tests_parallel.py'
+    runner.write_text(runner.read_text().replace(
+        '{"failed" if rc else "passed": 1}',
+        '({} if "EMPTY" in path.read_text() else {"passed": 1})'
+    ).replace(
+        'return max(_run_one_file(ROOT / path)[1] for path in files)',
+        'results = [_run_one_file(ROOT / path) for path in files]\n    return max(r[1] for r in results) if any(r[3] for r in results) else 1'
+    ))
+    commit(repo)
+    state = tmp_path / 'shared-state'
+    state.mkdir()
+    (state / 'python-failures.json').write_text('["tests/test_bad.py"]')
+    result = run_python(repo, state)
+    assert result.returncode == int(all_empty), result.stdout + result.stderr
+    assert calls(repo) == ['test_bad.py', 'test_good.py']
+    assert (repo / '.git/hermes-collection-control-required').exists() == all_empty
 
 
 def test_shared_test_module_reference_falls_back_to_full_gate(tmp_path):
@@ -276,8 +366,93 @@ def test_interrupted_runner_reuses_only_completed_journal_entries(tmp_path):
     result = run_python(repo)
     assert result.returncode == 0, result.stderr
     assert 'run=1 cached=1' in result.stdout
-    assert calls(repo) == ['test_bad.py', 'test_good.py', 'test_bad.py']
-    assert 'PYTHON_COLLECTION_CONTROL file=tests/test_bad.py' in result.stdout
+    assert calls(repo) == ['test_bad.py', 'test_good.py']
+    assert 'PYTHON_COLLECTION_CONTROL' not in result.stdout
+
+
+@pytest.mark.parametrize('tail', ['truncated', 'no-newline'])
+def test_second_interruption_preserves_results_after_a_truncated_journal(tmp_path, tail):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_bad.py').write_text('PASS\n')
+    (repo / 'tests/test_last.py').write_text('PASS\n')
+    runner = repo / 'scripts/run_tests_parallel.py'
+    runner.write_text(runner.read_text().replace(
+        '    return max(_run_one_file(ROOT / path)[1] for path in files)',
+        '''    results = []
+    for path in files:
+        results.append(_run_one_file(ROOT / path)[1])
+        if (ROOT / '.git/crash').exists():
+            __import__('os')._exit(9)
+    return max(results)'''))
+    commit(repo)
+    crash = repo / '.git/crash'
+    crash.touch()
+    assert run_python(repo).returncode == 9
+    journal = repo / '.git/hermes-python-results.jsonl'
+    if tail == 'truncated':
+        with journal.open('a') as stream:
+            stream.write('{"truncated":')
+    else:
+        journal.write_text(journal.read_text().rstrip('\n'))
+    assert run_python(repo).returncode == 9
+    assert set(evidence.read_evidence(repo)['results']) == {
+        'tests/test_bad.py', 'tests/test_good.py',
+    }
+    crash.unlink()
+    result = run_python(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'run=1 cached=2' in result.stdout
+    assert calls(repo) == ['test_bad.py', 'test_good.py', 'test_last.py']
+
+
+def test_journal_keeps_only_results_since_the_last_checkpoint(tmp_path):
+    repo = python_case(tmp_path)
+    assert run_python(repo).returncode == 1
+    assert run_python(repo).returncode == 1
+    journal = repo / '.git/hermes-python-results.jsonl'
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [entry['path'] for entry in entries] == ['tests/test_bad.py']
+    assert set(evidence.read_evidence(repo)['results']) == {
+        'tests/test_bad.py', 'tests/test_good.py',
+    }
+
+
+@pytest.mark.parametrize('boundary', ['before-truncate', 'after-truncate', 'after-invalidation'])
+def test_interrupted_checkpoint_cannot_restore_invalidated_helper_results(tmp_path, monkeypatch, boundary):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_bad.py').write_text('PASS\n')
+    (repo / 'tests/test_good.py').write_text('# imports helpers from test_bad\n')
+    commit(repo)
+    assert run_python(repo).returncode == 0
+    (repo / 'tests/test_bad.py').write_text('PASS\n# changed helper\n')
+    commit(repo)
+    current_files = evidence.source_map(repo)
+    original_write = evidence.write_json
+    original_unlink = Path.unlink
+    journal = repo / '.git/hermes-python-results.jsonl'
+
+    def interrupted_write(path, data):
+        original_write(path, data)
+        if boundary == 'after-invalidation' and data.get('files') == current_files:
+            raise RuntimeError('simulated interruption')
+
+    def interrupted_unlink(path, *args, **kwargs):
+        if path == journal and boundary == 'before-truncate':
+            raise RuntimeError('simulated interruption')
+        original_unlink(path, *args, **kwargs)
+        if path == journal and boundary == 'after-truncate':
+            raise RuntimeError('simulated interruption')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(evidence, 'write_json', interrupted_write)
+        patch.setattr(Path, 'unlink', interrupted_unlink)
+        with pytest.raises(RuntimeError, match='simulated interruption'):
+            evidence.verify(repo)
+    result = run_python(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'run=2 cached=0' in result.stdout
+    assert calls(repo).count('test_good.py') == 2
+    assert calls(repo).count('test_bad.py') == 2
 
 
 def test_verification_stages_cannot_share_tmp_git_boundaries():
@@ -392,6 +567,109 @@ def test_empty_only_cached_subset_includes_a_real_collection_control(tmp_path):
     assert 'PYTHON_COLLECTION_CONTROL file=tests/test_bad.py' in result.stdout
     assert calls(repo).count('test_bad.py') == 2
     assert calls(repo).count('test_good.py') == 2
+
+
+@pytest.mark.parametrize('control', ['PASS', 'EMPTY', 'FAIL'])
+@pytest.mark.parametrize('shared_change', [False, True])
+def test_repaired_failure_with_no_collection_uses_current_control_result(tmp_path, control, shared_change):
+    repo = python_case(tmp_path)
+    runner = repo / 'scripts/run_tests_parallel.py'
+    runner.write_text(runner.read_text().replace(
+        '{"failed" if rc else "passed": 1}',
+        '({} if "EMPTY" in path.read_text() else {"failed" if rc else "passed": 1})'
+    ).replace(
+        'return max(_run_one_file(ROOT / path)[1] for path in files)',
+        'results = [_run_one_file(ROOT / path) for path in files]\n    return max(r[1] for r in results) if any(r[3] for r in results) else 1'
+    ))
+    commit(repo)
+    assert run_python(repo).returncode == 1
+    (repo / 'tests/test_bad.py').write_text('EMPTY\n')
+    (repo / 'tests/test_good.py').write_text(control + '\n')
+    if shared_change:
+        (repo / 'runtime.py').write_text('version = 2\n')
+    commit(repo)
+    result = run_python(repo)
+    assert result.returncode == (0 if control == 'PASS' else 1), result.stdout + result.stderr
+    assert 'PYTHON_COLLECTION_CONTROL file=tests/test_good.py' in result.stdout
+    assert calls(repo).count('test_bad.py') == 2
+    assert calls(repo).count('test_good.py') == 2
+
+
+def test_interruption_before_collection_guard_requires_a_live_control(tmp_path):
+    repo = python_case(tmp_path)
+    runner = repo / 'scripts/run_tests_parallel.py'
+    runner.write_text(runner.read_text().replace(
+        '{"failed" if rc else "passed": 1}',
+        '({} if "EMPTY" in path.read_text() else {"failed" if rc else "passed": 1})'
+    ).replace(
+        '    return max(_run_one_file(ROOT / path)[1] for path in files)',
+        '''    results = [_run_one_file(ROOT / path) for path in files]
+    marker = ROOT / '.git/crash_before_guard'
+    if marker.exists():
+        marker.unlink()
+        __import__('os')._exit(9)
+    return max(r[1] for r in results) if any(r[3] for r in results) else 1'''
+    ))
+    commit(repo)
+    assert run_python(repo).returncode == 1
+    (repo / 'tests/test_bad.py').write_text('EMPTY\n')
+    commit(repo)
+    (repo / '.git/crash_before_guard').touch()
+    assert run_python(repo).returncode == 9
+    assert (repo / '.git/hermes-collection-control-required').exists()
+    result = run_python(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'run=1 cached=1' in result.stdout
+    assert calls(repo) == ['test_bad.py', 'test_good.py', 'test_bad.py', 'test_good.py']
+    assert not (repo / '.git/hermes-collection-control-required').exists()
+
+
+def test_later_empty_batch_reuses_a_completed_live_control(tmp_path):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_last.py').write_text('EMPTY\n')
+    runner = repo / 'scripts/run_tests_parallel.py'
+    runner.write_text(runner.read_text().replace(
+        '{"failed" if rc else "passed": 1}',
+        '({} if "EMPTY" in path.read_text() else {"failed" if rc else "passed": 1})'
+    ).replace(
+        'return max(_run_one_file(ROOT / path)[1] for path in files)',
+        'results = [_run_one_file(ROOT / path) for path in files]\n    return max(r[1] for r in results) if any(r[3] for r in results) else 1'
+    ))
+    commit(repo)
+    assert run_python(repo).returncode == 1
+    (repo / 'tests/test_bad.py').write_text('EMPTY\n')
+    (repo / 'runtime.py').write_text('version = 2\n')
+    commit(repo)
+    result = run_python(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls(repo) == ['test_bad.py', 'test_good.py', 'test_last.py'] * 2
+    assert not (repo / '.git/hermes-collection-control-required').exists()
+
+
+@pytest.mark.parametrize('outcome', ['passed', 'skipped', 'xfailed'])
+def test_interrupted_collected_results_can_supply_a_live_control(tmp_path, outcome):
+    repo = python_case(tmp_path)
+    (repo / 'tests/test_bad.py').write_text('PASS\n')
+    runner = repo / 'scripts/run_tests_parallel.py'
+    runner.write_text(runner.read_text().replace(
+        '{"failed" if rc else "passed": 1}', repr({outcome: 1})
+    ).replace(
+        '    return max(_run_one_file(ROOT / path)[1] for path in files)',
+        '''    results = [_run_one_file(ROOT / path) for path in files]
+    marker = ROOT / '.git/crash_once'
+    if marker.exists():
+        marker.unlink()
+        __import__('os')._exit(9)
+    return max(r[1] for r in results)'''
+    ))
+    commit(repo)
+    (repo / '.git/crash_once').touch()
+    assert run_python(repo).returncode == 9
+    result = run_python(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'run=1 cached=1' in result.stdout
+    assert len(calls(repo)) == 3
+    assert not (repo / '.git/hermes-collection-control-required').exists()
 
 
 def test_zero_collected_full_matrix_cannot_become_a_cached_pass(tmp_path):

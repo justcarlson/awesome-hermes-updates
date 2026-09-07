@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Install one immutable package generation, then switch it into use."""
 import argparse
+from contextlib import ExitStack
 import hashlib
 import os
 from pathlib import Path
@@ -70,7 +71,7 @@ def main():
                 parser.error(f'missing required command: {command}')
     if use_systemd:
         helper['check_user_manager']()
-    with helper['settings_lock'](previous, reject_pending=bool(args.repo or args.hermes_home)):
+    with helper['settings_lock'](previous, reject_pending=bool(args.repo or args.hermes_home)), ExitStack() as cleanup, ExitStack() as rollback:
         # Skill stores can contain user-edited copies. Only manage our own links.
         for client in selected:
             dest = skill_links[client]
@@ -98,17 +99,33 @@ def main():
             finally:
                 if staging.exists():
                     shutil.rmtree(staging)
+        snapshots = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='.rollback-', dir=base)))
+
+        def replace_link(target, dest):
+            temporary = dest.with_name(dest.name + f'.install-{os.getpid()}')
+            temporary.symlink_to(target)
+            try:
+                temporary.replace(dest)
+            finally:
+                temporary.unlink(missing_ok=True)
+
         def link(target, dest):
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists() and not dest.is_symlink():
+            if dest.is_symlink():
+                restore = (replace_link, dest.readlink(), dest)
+            elif dest.exists():
+                snapshot = snapshots / dest.relative_to(home)
+                snapshot.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dest, snapshot)
+                restore = (os.replace, snapshot, dest)
                 backup = base / 'previous' / dest.relative_to(home)
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 if not backup.exists():
                     shutil.copy2(dest, backup)
-            temporary = dest.with_name(dest.name + f'.install-{os.getpid()}')
-            temporary.symlink_to(target)
-            temporary.replace(dest)
-        link(release, base / 'current')
+            else:
+                restore = (dest.unlink,)
+            replace_link(target, dest)
+            rollback.callback(*restore)
         # Some users share skill stores by symlinking the parent directory.
         selected_locations = {skill_links[client].parent.resolve() / skill_links[client].name
                               for client in selected}
@@ -118,6 +135,7 @@ def main():
             elif (dest.parent.resolve() / dest.name not in selected_locations
                   and dest.is_symlink() and dest.readlink() == skill_target):
                 dest.unlink()
+                rollback.callback(replace_link, skill_target, dest)
         helper['atomic_write'](skill_selection, clients + '\n')
         for file in (release / 'bin').iterdir():
             link(base / 'current/bin' / file.name, home / '.local/bin' / file.name)
@@ -135,6 +153,9 @@ def main():
             if not fresh_timer and not args.schedule and old_calendar is not None:
                 helper['atomic_write'](timer_dropin, old_calendar)
         (base / 'source').write_text(str(source) + '\n')
+        # Keep the old release selected until every installation file is ready.
+        link(release, base / 'current')
+        rollback.pop_all()
     if use_systemd:
         helper['systemctl']('daemon-reload')
         if args.schedule or fresh_timer:
