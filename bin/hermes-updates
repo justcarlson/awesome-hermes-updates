@@ -69,7 +69,10 @@ def main():
             use_systemd = args.command == 'schedule' or not args.no_systemd
             if use_systemd:
                 config['check_user_manager']()
-            with config['settings_lock'](old):
+            changed = {key for key in updated if old[key] != updated[key]}
+            repair_only = bool(changed) and args.command == 'configure' and changed <= {
+                'HERMES_UPDATE_MAX_REPAIRS', 'HERMES_UPDATE_REPAIR_AGENT'}
+            with config['settings_lock'](old, reject_pending=not repair_only):
                 if config['read_config'](path) != saved:
                     raise ValueError('configuration changed before locking; retry the command')
                 config['save_settings'](path, Path.home(), proposed, updated, use_systemd,
