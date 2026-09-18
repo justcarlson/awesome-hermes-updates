@@ -141,6 +141,11 @@ hermes-updates configure --repair-agent claude --max-repairs 4
 `HERMES_UPDATE_REPAIR_AGENT` selects `codex` (the compatibility default) or `claude`.
 Both use the same fixed candidate, verification gate, and saved attempt budget.
 Each attempt has ten minutes.
+You can enable repairs after a zero-attempt stop with the same `configure`
+command. The next run resumes the saved candidate and archives the disabled-repair
+block. Repair-only settings can change while recovery is pending, but an active
+run still holds the settings lock. Exhausted positive budgets and other terminal
+blocks remain blocked; changing settings does not reset recorded attempts.
 Claude repairs require Claude Code 2.1.246+, Bubblewrap, and socat. Complete login
 with `CLAUDE_CONFIG_DIR="$HOME/.claude" claude auth login` before unattended use;
 the updater uses that directory for credentials and writable CLI state.

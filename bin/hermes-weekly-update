@@ -399,6 +399,26 @@ recover_empty_collection_block() {
   repair_failure_log=-
 }
 
+recover_repair_opt_in() {
+  local blocked="$candidate/.git/hermes-repair-blocked"
+  local counter="$candidate/.git/hermes-repair-count" count=0
+  [[ "$repair_phase" == repair && -f "$blocked" ]] || return 0
+  ((max_repairs > 0)) || return 0
+  [[ "$(cat "$blocked")" == "BLOCKED total repair budget exhausted or invalid: count=0 limit=0; target=$target_sha candidate=$candidate" ]] || return 0
+  [[ ! -f "$counter" ]] || read -r count <"$counter"
+  [[ "$count" == 0 ]] || return 0
+  [[ "$(git -C "$candidate" rev-parse HEAD)" == "$repair_checkpoint" ]] || return 0
+  read_worktree_status "$candidate" "repair opt-in recovery" || return 78
+  [[ -z "$worktree_status" ]] || return 0
+  # Only the initial disabled-repair stop can resume. Keep exhausted attempts and
+  # other terminal blocks intact; configuration changes never reset counters.
+  mv -- "$blocked" "$candidate/.git/hermes-disabled-repair-block.recovered.$(date +%s).$$"
+  # Opting in resumes this saved target even when it has aged or upstream moved.
+  export HERMES_UPDATE_TARGET_SHA="$target_sha"
+  printf 'RECOVERED_REPAIR_OPT_IN target=%s candidate=%s limit=%s\n' \
+    "$target_sha" "$candidate" "$max_repairs"
+}
+
 recover_controller_budget() {
   local blocked="$candidate/.git/hermes-repair-blocked"
   local revision="$candidate/.git/hermes-controller-revision"
@@ -537,6 +557,7 @@ if [[ -f "$repair_pending_file" ]]; then
     candidate="$repair_candidate"
     keep_candidate=1
     if [[ "$mode" != check ]]; then
+      recover_repair_opt_in || exit "$?"
       recover_empty_collection_block || exit "$?"
       recover_controller_budget || exit "$?"
       recover_verifier_device_block || exit "$?"
