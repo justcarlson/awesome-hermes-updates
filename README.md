@@ -146,6 +146,14 @@ command. The next run resumes the saved candidate and archives the disabled-repa
 block. Repair-only settings can change while recovery is pending, but an active
 run still holds the settings lock. Exhausted positive budgets and other terminal
 blocks remain blocked; changing settings does not reset recorded attempts.
+After an intermittent verification failure exhausts a positive repair budget,
+an operator can request `hermes-updates run --reverify`. This grants one full-gate
+recheck of the unchanged saved candidate, with no further source repairs. It
+preserves the frozen target, archives the previous block, and keeps every attempt
+counter. A second failed gate stops terminally. Interrupted verification and
+deployment still resume through the managed workflow. For the scheduled service,
+use a temporary reviewed `ExecStart` override adding `--reverify`, then remove it
+after the terminal result.
 Claude repairs require Claude Code 2.1.246+, Bubblewrap, and socat. Complete login
 with `CLAUDE_CONFIG_DIR="$HOME/.claude" claude auth login` before unattended use;
 the updater uses that directory for credentials and writable CLI state.

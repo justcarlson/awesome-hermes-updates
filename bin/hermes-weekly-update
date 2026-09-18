@@ -23,6 +23,7 @@ keep_candidate=0
 target_sha=""
 production_sha=""
 mode="promote"
+reverify=0
 max_repairs="${HERMES_UPDATE_MAX_REPAIRS:-0}"
 repair_agent="${HERMES_UPDATE_REPAIR_AGENT:-codex}"
 profiles_file="$state_dir/deployment-profiles"
@@ -36,9 +37,12 @@ updater_digest="$(cat "$package_bin"/hermes-* | sha256sum | cut -d ' ' -f 1)"
 if [[ "${1:-}" == "--check" || "${1:-}" == "--plan" ]]; then
   mode="${1#--}"
   shift
+elif [[ "${1:-}" == "--reverify" ]]; then
+  reverify=1
+  shift
 fi
 if (($#)); then
-  printf 'usage: hermes-weekly-update [--check|--plan]\n' >&2
+  printf 'usage: hermes-weekly-update [--check|--plan|--reverify]\n' >&2
   exit 64
 fi
 
@@ -419,6 +423,44 @@ recover_repair_opt_in() {
     "$target_sha" "$candidate" "$max_repairs"
 }
 
+recover_verification_only() {
+  ((reverify)) || return 0
+  local blocked="$candidate/.git/hermes-repair-blocked"
+  local receipt="$candidate/.git/hermes-reverify-checkpoint"
+  local count limit text
+  if [[ -f "$receipt" ]]; then
+    # Interrupted verification can resume, but a second rejected gate cannot.
+    if [[ "$repair_phase" != verify || -f "$blocked" \
+      || "$(cat "$receipt")" != "$repair_checkpoint" ]]; then
+      printf 'BLOCKED verification-only recovery was already used\n' >&2
+      return 78
+    fi
+    export HERMES_UPDATE_TARGET_SHA="$target_sha"
+    return 0
+  fi
+  [[ "$repair_phase" == repair && -f "$blocked" ]] || return 78
+  text="$(cat "$blocked")"
+  [[ "$text" =~ count=([1-9][0-9]?)\ limit=([1-9][0-9]?) ]] || return 78
+  count="${BASH_REMATCH[1]}" limit="${BASH_REMATCH[2]}"
+  ((count >= limit && count <= 20 && limit <= 20)) || return 78
+  [[ "$text" == "BLOCKED total repair budget exhausted or invalid: count=$count limit=$limit; target=$target_sha candidate=$candidate" ]] || return 78
+  [[ -f "$candidate/.git/hermes-repair-count" \
+    && "$(cat "$candidate/.git/hermes-repair-count")" == "$count" ]] || return 78
+  [[ "$(git -C "$candidate" rev-parse HEAD)" == "$repair_checkpoint" ]] || return 78
+  read_worktree_status "$candidate" "verification-only recovery" || return 78
+  [[ -z "$worktree_status" ]] || return 78
+  # Record the one-shot before archiving anything. Neither source-repair nor
+  # controller counters are reset, including if this transition is interrupted.
+  printf '%s\n' "$repair_checkpoint" >"$receipt.tmp.$$"
+  mv -- "$receipt.tmp.$$" "$receipt"
+  mv -- "$blocked" "$candidate/.git/hermes-reverify-block.$(date +%s).$$"
+  write_repair_pending verify "$candidate" "$repair_checkpoint" -
+  repair_phase=verify
+  repair_failure_log=-
+  export HERMES_UPDATE_TARGET_SHA="$target_sha"
+  printf 'REVERIFY_PENDING target=%s candidate=%s repairs=%s\n' "$target_sha" "$candidate" "$count"
+}
+
 recover_controller_budget() {
   local blocked="$candidate/.git/hermes-repair-blocked"
   local revision="$candidate/.git/hermes-controller-revision"
@@ -486,6 +528,11 @@ fi
 # Deployment policy is independent of target selection and candidate recovery.
 source "$package_bin/hermes-update-deployment"
 
+if ((reverify)) && [[ ! -f "$repair_pending_file" && ! -f "$pending_file" ]]; then
+  printf 'BLOCKED --reverify requires a pending transaction\n' >&2
+  exit 78
+fi
+
 if [[ "$mode" == plan ]]; then
   resolve_update_policy
   printf 'Resolved actions: python=%s node=%s dashboard=%s gateway=%s migrate=%s runtime=%s\n' \
@@ -543,6 +590,10 @@ fi
 production_sha="$(git -C "$repo" rev-parse HEAD)"
 if [[ -f "$repair_pending_file" ]]; then
   load_repair_pending
+  if ((reverify)) && [[ "$repair_phase" == selected ]]; then
+    printf 'BLOCKED --reverify requires a saved candidate\n' >&2
+    exit 78
+  fi
   if [[ "$mode" != check && -z "${HERMES_UPDATE_DEPLOY_COMMAND:-}" ]]; then
     load_deployment_profiles "$production_sha"
   fi
@@ -557,6 +608,7 @@ if [[ -f "$repair_pending_file" ]]; then
     candidate="$repair_candidate"
     keep_candidate=1
     if [[ "$mode" != check ]]; then
+      recover_verification_only || exit "$?"
       recover_repair_opt_in || exit "$?"
       recover_empty_collection_block || exit "$?"
       recover_controller_budget || exit "$?"
@@ -730,6 +782,9 @@ repair_candidate() {
   local budget_file="$candidate/.git/hermes-repair-count"
   local repair_count=0
   local before_repair
+  if ((reverify)) || [[ -f "$candidate/.git/hermes-reverify-checkpoint" ]]; then
+    block_candidate 'verification-only recovery failed; no further source repairs permitted'
+  fi
   before_repair="$(git -C "$candidate" rev-parse HEAD)"
   if [[ -f "$budget_file" ]]; then
     read -r repair_count <"$budget_file"

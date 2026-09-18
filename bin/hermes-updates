@@ -30,7 +30,9 @@ def main():
     schedule = commands.add_parser('schedule', help='set on-demand or a systemd calendar, e.g. "daily"')
     schedule.add_argument('calendar')
     run = commands.add_parser('run', help='run an update with systemd resource limits')
-    run.add_argument('--check', action='store_true', help='check upstream without promoting an update')
+    run_mode = run.add_mutually_exclusive_group()
+    run_mode.add_argument('--check', action='store_true', help='check upstream without promoting an update')
+    run_mode.add_argument('--reverify', action='store_true', help='one verification-only recovery after source repairs are exhausted')
     run.add_argument('--direct', action='store_true', help='run in this terminal without systemd resource limits')
     args = parser.parse_args()
     try:
@@ -81,6 +83,8 @@ def main():
         elif args.command == 'run':
             controller = Path(__file__).resolve().with_name('hermes-weekly-update')
             arguments = [str(controller)] + (['--check'] if args.check else [])
+            if args.reverify:
+                arguments.append('--reverify')
             if args.direct:
                 os.execve(controller, arguments, config['runtime_environment'](settings))
             config['prepare_runtime_dirs'](Path.home(), settings)
